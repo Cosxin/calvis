@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (downloaded separately)
+data/samples/
+data/sweeps/
+data/v1.0-mini/
+data/maps/
+data/*.json
+
+# Checkpoints (downloaded separately)
+checkpoints/*.pth
+checkpoints/*.pt
+
+# Test files
+test/
+test_*.py
+
+# Misc
+*.tar.gz
+.claude/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Large binary assets in third_party
+third_party/*/assets/
+third_party/TPVFormer-main/

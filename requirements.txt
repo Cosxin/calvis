@@ -1,0 +1,16 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=9.0.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+gradio>=4.0.0
+nuscenes-devkit>=1.1.11
+pyquaternion>=0.9.9
+captum>=0.7.0
+efficientnet-pytorch>=0.7.0
+opencv-python>=4.8.0
+mmcv>=2.0.0
+mmdet>=3.0.0
+mmdet3d>=1.1.0
+mmengine>=0.7.0
