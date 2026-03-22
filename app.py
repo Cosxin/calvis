@@ -1,8 +1,11 @@
 """BEV Attribution Debug Tool — FastAPI + custom HTML frontend."""
 
-import base64, io, json, logging, time, traceback, collections
+import os, base64, io, json, logging, time, traceback, collections
 import numpy as np
 from PIL import Image
+
+# Ensure CWD is the project root (where this file lives) so relative paths work
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import uvicorn
 from fastapi import FastAPI
@@ -252,7 +255,7 @@ async def api_load_scene(req: LoadReq):
         'repr_types': _get_repr_types(),
         'repr_type': backend.repr_type if backend else 'bev_seg',
         'has_3d': _st.get('raw_output') is not None and _st['raw_output'].ndim == 4,
-        'num_cameras': len(sample.get('images', [])),
+        'num_cameras': len(sample.get('images', [])) if sample else 6,
         'status': ' | '.join(parts) or 'Ready',
     })
 
