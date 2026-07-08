@@ -142,6 +142,80 @@ def _parse_calibration(nusc, cam_data: dict):
     return intrinsic, world_to_camera, ego_to_camera, cam_to_global
 
 
+def gt_boxes_to_bev(gt_boxes, ego_to_global):
+    """Transform GT boxes from global frame to ego-frame BEV corners.
+
+    Args:
+        gt_boxes: list of dicts from _parse_annotations (center, size, rotation, class in global).
+        ego_to_global: 4x4 matrix (ego → global).
+
+    Returns:
+        list of dicts with:
+            corners: list of 4 (x, y) tuples in ego frame (meters)
+            class_idx: int index into CLASS_NAMES
+            class_name: str
+    """
+    from pyquaternion import Quaternion
+    global_to_ego = np.linalg.inv(ego_to_global)
+
+    # Map category names to class indices
+    _class_map = {
+        'vehicle.car': 0, 'vehicle.truck': 1, 'vehicle.bus.bendy': 2,
+        'vehicle.bus.rigid': 2, 'vehicle.trailer': 3,
+        'vehicle.construction': 4, 'human.pedestrian.adult': 5,
+        'human.pedestrian.child': 5, 'human.pedestrian.police_officer': 5,
+        'human.pedestrian.construction_worker': 5,
+        'vehicle.motorcycle': 6, 'vehicle.bicycle': 7,
+        'movable_object.trafficcone': 8, 'movable_object.barrier': 9,
+    }
+
+    bev_boxes = []
+    for box in gt_boxes:
+        center_global = box['center']  # [x, y, z]
+        w, l, h = box['size']  # width, length, height
+        q = Quaternion(box['rotation'])
+
+        # 4 BEV corners in object frame (ground plane)
+        corners_obj = np.array([
+            [ w/2,  l/2, 0],
+            [-w/2,  l/2, 0],
+            [-w/2, -l/2, 0],
+            [ w/2, -l/2, 0],
+        ])
+
+        # Object → global → ego → BEV world coords
+        # Ego frame: x=forward, y=left
+        # BEV world: wx=right (-ego_y), wz=forward (ego_x)
+        # _draw_gt_boxes expects (wx, wz) pairs
+        corners_bev = []
+        for c in corners_obj:
+            g = q.rotate(c) + center_global
+            g_h = np.array([g[0], g[1], g[2], 1.0])
+            e = global_to_ego @ g_h
+            bev_wx = -float(e[1])  # right = -left
+            bev_wz = float(e[0])   # forward
+            corners_bev.append((bev_wx, bev_wz))
+
+        cat = box.get('class', '')
+        class_idx = _class_map.get(cat, -1)
+        if class_idx < 0:
+            # Try prefix match
+            for key, idx in _class_map.items():
+                if cat.startswith(key.split('.')[0]):
+                    class_idx = idx
+                    break
+            if class_idx < 0:
+                class_idx = 0
+
+        bev_boxes.append({
+            'corners': corners_bev,
+            'class_idx': class_idx,
+            'class_name': cat,
+        })
+
+    return bev_boxes
+
+
 def _parse_annotations(nusc, sample_token: str) -> List[Dict]:
     """Parse ground-truth 3D bounding boxes for a sample.
 
@@ -164,6 +238,32 @@ def _parse_annotations(nusc, sample_token: str) -> List[Dict]:
             }
         )
     return gt_boxes
+
+
+def find_first_available_scene(dataroot: str = "data/") -> Tuple[int, int]:
+    """Return (scene_idx, sample_idx) for the first sample where all 6 camera
+    images exist on disk.  Falls back to (0, 0) if none found."""
+    try:
+        nusc = _get_nuscenes(dataroot)
+        for scene_idx, scene in enumerate(nusc.scene):
+            sample_token = scene["first_sample_token"]
+            sample_idx_inner = 0
+            while sample_token:
+                sample_record = nusc.get("sample", sample_token)
+                all_exist = all(
+                    os.path.isfile(os.path.join(
+                        nusc.dataroot,
+                        nusc.get("sample_data", sample_record["data"][cam])["filename"]
+                    ))
+                    for cam in CAMERA_NAMES
+                )
+                if all_exist:
+                    return scene_idx, sample_idx_inner
+                sample_token = sample_record["next"] or None
+                sample_idx_inner += 1
+    except Exception as e:
+        logger.warning("find_first_available_scene failed: %s", e)
+    return 0, 0
 
 
 def load_sample(
@@ -287,10 +387,82 @@ def load_sample(
         "lidar_to_global": lidar_to_global,
         "camera_names": list(CAMERA_NAMES),
         "gt_boxes": gt_boxes,
+        "ego_to_global": ego_to_global_lidar,
         "sample_token": sample_token,
         "scene_name": scene["name"],
         "original_sizes": original_sizes,
     }
+
+
+def load_sample_by_filename(
+    camera: str,
+    filename: str,
+    dataroot: str = "data/",
+    img_h: int = DEFAULT_IMG_H,
+    img_w: int = DEFAULT_IMG_W,
+) -> Dict:
+    """Load a nuScenes sample by matching a camera image filename.
+
+    Looks up which sample_data record has this filename, then loads the
+    full 6-camera sample (same as load_sample but identified by image file).
+
+    Parameters
+    ----------
+    camera : str
+        Camera name (e.g. 'CAM_FRONT').
+    filename : str
+        Image filename (e.g. 'n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151603512404.jpg').
+    dataroot : str
+        Path to nuScenes data root.
+
+    Returns
+    -------
+    Same dict as load_sample().
+    """
+    nusc = _get_nuscenes(dataroot)
+
+    # Find sample_data record matching this filename
+    target_path = f"samples/{camera}/{filename}"
+    sd_token = None
+    for sd in nusc.sample_data:
+        if sd["filename"] == target_path:
+            sd_token = sd["token"]
+            break
+
+    if sd_token is None:
+        raise FileNotFoundError(
+            f"Could not find sample_data for {camera}/{filename} in nuScenes database"
+        )
+
+    sd_record = nusc.get("sample_data", sd_token)
+    sample_token = sd_record["sample_token"]
+
+    # Find which scene and sample_idx this corresponds to
+    sample_record = nusc.get("sample", sample_token)
+    scene_token = sample_record["scene_token"]
+
+    # Find scene index
+    scene_idx = None
+    for i, scene in enumerate(nusc.scene):
+        if scene["token"] == scene_token:
+            scene_idx = i
+            break
+
+    # Find sample index within scene
+    scene = nusc.scene[scene_idx]
+    cur_token = scene["first_sample_token"]
+    sample_idx = 0
+    while cur_token != sample_token:
+        cur_record = nusc.get("sample", cur_token)
+        if cur_record["next"] == "":
+            break
+        cur_token = cur_record["next"]
+        sample_idx += 1
+
+    logger.info("Matched %s/%s → scene %d (%s), sample %d",
+                camera, filename, scene_idx, scene["name"], sample_idx)
+
+    return load_sample(scene_idx, sample_idx, dataroot, img_h, img_w)
 
 
 def get_scene_info(dataroot: str = "data/") -> List[Dict]:

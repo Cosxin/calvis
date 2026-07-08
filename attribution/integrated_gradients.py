@@ -77,7 +77,7 @@ def _build_captum_forward(model, sample: dict, cell_i: int, cell_j: int,
 
 
 def attr_ig(model, sample: dict, cell_i: int, cell_j: int,
-            class_idx: int = 0, n_steps: int = 50,
+            class_idx: int = 0, n_steps: int = 20,
             baseline: str = 'black', device: str = 'cpu') -> np.ndarray:
     """Compute Integrated Gradients attribution using Captum.
 
@@ -131,7 +131,7 @@ def attr_ig(model, sample: dict, cell_i: int, cell_j: int,
             input_tensor,
             baselines=baseline_tensor,
             n_steps=n_steps,
-            method='gausslegendre',
+            method='riemann_trapezoid',
         )
 
         # attributions shape: [1, 6, 3, H, W]

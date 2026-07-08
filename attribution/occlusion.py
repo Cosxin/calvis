@@ -30,8 +30,8 @@ def _build_captum_forward(model, sample: dict, cell_i: int, cell_j: int,
 
 
 def attr_occlusion(model, sample: dict, cell_i: int, cell_j: int,
-                   class_idx: int = 0, patch_size: int = 32,
-                   stride: int = 16, device: str = 'cpu') -> np.ndarray:
+                   class_idx: int = 0, patch_size: int = 64,
+                   stride: int = 64, device: str = 'cpu') -> np.ndarray:
     """Compute occlusion-based attribution using Captum.
 
     Slides a grey patch across each camera image and measures the change

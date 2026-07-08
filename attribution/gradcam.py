@@ -11,40 +11,63 @@ logger = logging.getLogger(__name__)
 
 
 def _find_last_conv_layer(model) -> str:
-    """Auto-detect the last convolutional layer in the model's backbone.
+    """Auto-detect the best convolutional layer for GradCAM attribution.
 
-    Walks the model's named modules in reverse order and returns the name
-    of the last Conv2d layer found. Prefers layers inside 'backbone' or
-    'img_backbone' submodules.
+    For BEV models, we need a layer in the **camera encoder** (not the BEV
+    encoder), because GradCAM on camera encoder features produces per-camera
+    spatial heatmaps. GradCAM on BEV encoder layers produces a single BEV
+    heatmap that can't be meaningfully split across 6 cameras.
+
+    Strategy:
+    1. Prefer layers inside 'camencode' / 'img_backbone' / 'backbone' (camera path)
+    2. Avoid 'bevencode' / 'bev_encoder' / 'neck' (BEV path)
+    3. Pick the last Conv2d with >= 64 output channels (rich feature maps)
 
     Args:
         model: PyTorch model.
 
     Returns:
-        Dotted name string for the layer (e.g., 'backbone.layer4.2.conv3').
+        Dotted name string for the layer.
 
     Raises:
-        RuntimeError: If no Conv2d layer is found.
+        RuntimeError: If no suitable Conv2d layer is found.
     """
-    last_conv_name = None
-    last_backbone_conv_name = None
+    cam_encoder_conv = None
+    fallback_conv = None
+
+    bev_keywords = ('bevencode', 'bev_encode', 'neck')
+    cam_keywords = ('camencode', 'img_backbone', 'backbone', 'trunk')
+    # Avoid depth prediction heads — they output depth bins, not spatial features
+    skip_keywords = ('depthnet', 'depth_head', 'depth_net')
 
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d):
-            last_conv_name = name
-            # Prefer layers inside backbone-like submodules
             lower = name.lower()
-            if any(kw in lower for kw in ('backbone', 'img_backbone', 'encoder')):
-                last_backbone_conv_name = name
 
-    result = last_backbone_conv_name or last_conv_name
+            # Skip BEV encoder layers and depth heads
+            if any(kw in lower for kw in bev_keywords):
+                continue
+            if any(kw in lower for kw in skip_keywords):
+                continue
+
+            # Skip tiny 1x1 convs with few output channels (not useful for GradCAM)
+            if module.out_channels < 64:
+                continue
+
+            fallback_conv = name
+
+            # Prefer camera encoder layers
+            if any(kw in lower for kw in cam_keywords):
+                cam_encoder_conv = name
+
+    result = cam_encoder_conv or fallback_conv
     if result is None:
         raise RuntimeError(
-            "Could not find any Conv2d layer in the model. "
+            "Could not find any suitable Conv2d layer for GradCAM. "
             "Please specify layer_name explicitly."
         )
 
-    logger.info("Auto-detected last conv layer: %s", result)
+    logger.info("Auto-detected GradCAM target layer: %s (camera encoder)", result)
     return result
 
 

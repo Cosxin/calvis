@@ -3,16 +3,28 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Data (downloaded separately)
-data/samples/
-data/sweeps/
-data/v1.0-mini/
-data/maps/
-data/*.json
+# SmolVLM weights downloaded by Dockerfile
+checkpoints/smolvlm-256m/
 
-# Checkpoints (downloaded separately)
-checkpoints/*.pth
-checkpoints/*.pt
+# Sweeps/lidar not needed for demo
+data/sweeps/
+data/samples/LIDAR_TOP/
+# data/maps/ — map PNGs are committed (needed for NuScenes init)
+
+# Only keep 2 sample images per camera for demo (ignore the rest)
+data/samples/**/*.jpg
+!data/samples/CAM_BACK/n008-2018-08-01-15-16-36-0400__CAM_BACK__1533151603537558.jpg
+!data/samples/CAM_BACK/n008-2018-08-01-15-16-36-0400__CAM_BACK__1533151604037558.jpg
+!data/samples/CAM_BACK_LEFT/n008-2018-08-01-15-16-36-0400__CAM_BACK_LEFT__1533151603547405.jpg
+!data/samples/CAM_BACK_LEFT/n008-2018-08-01-15-16-36-0400__CAM_BACK_LEFT__1533151604047405.jpg
+!data/samples/CAM_BACK_RIGHT/n008-2018-08-01-15-16-36-0400__CAM_BACK_RIGHT__1533151603528113.jpg
+!data/samples/CAM_BACK_RIGHT/n008-2018-08-01-15-16-36-0400__CAM_BACK_RIGHT__1533151604028370.jpg
+!data/samples/CAM_FRONT/n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151603512404.jpg
+!data/samples/CAM_FRONT/n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151604012404.jpg
+!data/samples/CAM_FRONT_LEFT/n008-2018-08-01-15-16-36-0400__CAM_FRONT_LEFT__1533151603504799.jpg
+!data/samples/CAM_FRONT_LEFT/n008-2018-08-01-15-16-36-0400__CAM_FRONT_LEFT__1533151604004799.jpg
+!data/samples/CAM_FRONT_RIGHT/n008-2018-08-01-15-16-36-0400__CAM_FRONT_RIGHT__1533151603520482.jpg
+!data/samples/CAM_FRONT_RIGHT/n008-2018-08-01-15-16-36-0400__CAM_FRONT_RIGHT__1533151604020482.jpg
 
 # Test files
 test/
@@ -25,7 +37,4 @@ test_*.py
 dist/
 build/
 .DS_Store
-
-# Large binary assets in third_party
-third_party/*/assets/
-third_party/TPVFormer-main/
+.venv_314_backup/

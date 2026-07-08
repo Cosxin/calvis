@@ -2,6 +2,7 @@
 
 import os, base64, io, json, logging, time, traceback, collections
 import numpy as np
+import torch
 from PIL import Image
 
 # Ensure CWD is the project root (where this file lives) so relative paths work
@@ -34,7 +35,7 @@ logger = logging.getLogger("app")
 # ── Project imports ──────────────────────────────────────────────────────────
 _pipeline_ok = _attribution_ok = False
 try:
-    from pipeline.data import load_sample
+    from pipeline.data import load_sample, gt_boxes_to_bev, find_first_available_scene
     from pipeline.wrapper import infer, forward_fn, make_captum_forward
     _pipeline_ok = True
 except Exception as e:
@@ -58,34 +59,30 @@ GRID_RANGE, RESOLUTION = 51.2, 0.512
 GRID_CELLS = int(2*GRID_RANGE/RESOLUTION)
 
 def _get_repr_types():
-    """Build representation type list from available backends."""
-    types = []
-    # Map backend repr_type to UI labels
-    seen = set()
-    repr_labels = {
-        'bev_seg': '2D BEV Segmentation',
-        '3d_occ': '3D Occupancy',
-        'gaussian': 'Gaussian 3D',
-    }
-    if _backends_ok:
-        for name, cls in BACKENDS.items():
-            b = cls()
-            rt = b.repr_type
-            types.append({
-                'id': name,
-                'label': f"{repr_labels.get(rt, rt)} ({name})",
-                'available': True,
-                'repr_type': rt,
-            })
-    else:
-        types = [
-            {'id': 'lss', 'label': '2D BEV Seg (LSS)', 'available': True, 'repr_type': 'bev_seg'},
-        ]
-    return types
+    """Return the single available backend (LSS)."""
+    return [{'id': 'lss', 'label': 'LSS (Lift-Splat-Shoot)', 'available': True, 'repr_type': 'bev_seg'}]
 
 _st = dict(model=None, sample=None, bev_grid=None, heatmaps=None,
            backend=None, backend_name='lss', raw_output=None)
 _attr_cache = {}
+
+# ── VLM state ────────────────────────────────────────────────────────────────
+_vlm_ok = False
+try:
+    from pipeline.vlm import VLMRunner
+    _vlm_ok = True
+except Exception as e:
+    logging.getLogger("app").warning("VLM import failed: %s\n%s", e, traceback.format_exc())
+
+_vlm_st = dict(runner=None)
+_vlm_attr_cache = {}
+
+VLM_METHODS = {
+    'Attention': 'attention',
+    # GradCAM methods kept in backend (pipeline/vlm/model.py) but not exposed
+    # in VLM UI — they're not well suited for early-fusion VLM attribution.
+    # They'll be used for other tasks (BEV, CNN classifiers) later.
+}
 
 def _pil_uri(img, fmt='JPEG', q=82):
     buf = io.BytesIO()
@@ -134,7 +131,18 @@ def _ensure_model(backend_name=None):
     return _st['model']
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
+from fastapi import Request
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 server = FastAPI()
+
+@server.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """Convert all unhandled exceptions to JSON so the frontend can display them."""
+    tb = traceback.format_exc()
+    logger.error("Unhandled exception on %s: %s\n%s", request.url.path, exc, tb)
+    return JSONResponse(status_code=500, content={"error": str(exc), "traceback": tb})
 
 class LoadReq(BaseModel):
     scene_idx: int = 0
@@ -184,7 +192,15 @@ async def api_load_scene(req: LoadReq):
     t0 = time.time(); parts = []
     if _pipeline_ok:
         try:
-            _st['sample'] = load_sample(req.scene_idx, req.sample_idx)
+            scene_idx, sample_idx = req.scene_idx, req.sample_idx
+            # If the requested scene/sample has missing images, auto-find one that exists
+            try:
+                _st['sample'] = load_sample(scene_idx, sample_idx)
+            except FileNotFoundError:
+                logger.warning("Images missing for scene %d / sample %d — scanning for available data…", scene_idx, sample_idx)
+                scene_idx, sample_idx = find_first_available_scene()
+                logger.info("Auto-selected scene %d / sample %d", scene_idx, sample_idx)
+                _st['sample'] = load_sample(scene_idx, sample_idx)
             parts.append(f"Loaded {time.time()-t0:.2f}s")
             logger.info("Sample loaded in %.2fs", time.time()-t0)
             model = _ensure_model(backend_name=req.backend)
@@ -228,15 +244,27 @@ async def api_load_scene(req: LoadReq):
     model_classes = _get_model_class_info(_st.get('model'))
     backend = _st.get('backend')
     bev_class_colors = None
-    if backend is not None and hasattr(backend, 'name') and backend.name in ('tpvformer', 'gaussianformer', 'sparseocc'):
-        from pipeline.backends.tpvformer_backend import NUSCENES_LIDARSEG_COLORS
-        bev_class_colors = NUSCENES_LIDARSEG_COLORS
+
+    # Compute GT bounding boxes in ego-frame BEV coordinates
+    bev_gt_boxes = None
+    if sample and 'gt_boxes' in sample and 'ego_to_global' in sample:
+        try:
+            bev_gt_boxes = gt_boxes_to_bev(sample['gt_boxes'], sample['ego_to_global'])
+            logger.info("GT boxes: %d annotations → %d BEV boxes", len(sample['gt_boxes']), len(bev_gt_boxes))
+        except Exception as e:
+            logger.warning("Failed to compute GT BEV boxes: %s", e)
+    _st['bev_gt_boxes'] = bev_gt_boxes
 
     bev_imgs = {}
-    for m in ('argmax','class_heatmap','composite'):
+    bev_imgs_gt = {}  # versions with GT boxes
+    for m in ('argmax',):
         bev_imgs[m] = _pil_uri(render_bev(_st['bev_grid'], mode=m, target_class=0,
                                            grid_range=GRID_RANGE, resolution=RESOLUTION,
                                            class_names=model_classes, class_colors=bev_class_colors), fmt='PNG')
+        bev_imgs_gt[m] = _pil_uri(render_bev(_st['bev_grid'], mode=m, target_class=0,
+                                              gt_boxes=bev_gt_boxes,
+                                              grid_range=GRID_RANGE, resolution=RESOLUTION,
+                                              class_names=model_classes, class_colors=bev_class_colors), fmt='PNG')
     cell_classes, cell_confs = [], []
     actual_grid_cells = GRID_CELLS
     actual_resolution = RESOLUTION
@@ -246,15 +274,26 @@ async def api_load_scene(req: LoadReq):
         actual_grid_cells = _st['bev_grid'].shape[-1]  # Use actual grid size
         actual_resolution = 2 * GRID_RANGE / actual_grid_cells  # Compute matching resolution
 
+    # Serialize GT boxes for frontend hit-testing (corners in BEV world coords)
+    gt_boxes_json = []
+    if bev_gt_boxes:
+        for b in bev_gt_boxes:
+            gt_boxes_json.append({
+                'corners': b['corners'],  # list of 4 (wx, wz) tuples
+                'class_idx': b['class_idx'],
+                'class_name': b['class_name'],
+            })
+
     return JSONResponse({
         'camera_images': cam_uris, 'intrinsics': intrinsics, 'extrinsics': extrinsics,
         'image_sizes': img_sizes, 'camera_names': list(CAMERA_NAMES),
         'bev_images': bev_imgs,
+        'bev_images_gt': bev_imgs_gt,
+        'gt_boxes': gt_boxes_json,
         'bev_info': {'grid_range':GRID_RANGE,'resolution':actual_resolution,'grid_cells':actual_grid_cells,
                      'class_names':model_classes,'cell_classes':cell_classes,'cell_confs':cell_confs},
         'repr_types': _get_repr_types(),
         'repr_type': backend.repr_type if backend else 'bev_seg',
-        'has_3d': _st.get('raw_output') is not None and _st['raw_output'].ndim == 4,
         'num_cameras': len(sample.get('images', [])) if sample else 6,
         'status': ' | '.join(parts) or 'Ready',
     })
@@ -266,43 +305,11 @@ async def api_render_bev(req: BevReq):
     ci = model_classes.index(req.class_name) if req.class_name in model_classes else 0
     backend = _st.get('backend')
     bev_class_colors = None
-    if backend is not None and hasattr(backend, 'name') and backend.name in ('tpvformer', 'gaussianformer', 'sparseocc'):
-        from pipeline.backends.tpvformer_backend import NUSCENES_LIDARSEG_COLORS
-        bev_class_colors = NUSCENES_LIDARSEG_COLORS
     img = render_bev(_st['bev_grid'], mode=req.mode, target_class=ci,
+                     gt_boxes=_st.get('bev_gt_boxes'),
                      grid_range=GRID_RANGE, resolution=RESOLUTION,
                      class_names=model_classes, class_colors=bev_class_colors)
     return JSONResponse({'bev_image': _pil_uri(img, fmt='PNG')})
-
-@server.post("/api/occupancy-3d")
-async def api_occupancy_3d():
-    """Return sparse voxel data for 3D viewer."""
-    backend = _st.get('backend')
-    raw = _st.get('raw_output')
-    if backend is None or raw is None:
-        return JSONResponse({'error': 'No model loaded or no 3D data'}, status_code=400)
-    if raw.ndim != 4:
-        return JSONResponse({'error': 'Model output is 2D, no 3D data available'}, status_code=400)
-
-    logger.info("occupancy-3d: raw shape=%s, ndim=%d", raw.shape, raw.ndim)
-    sparse = backend.get_sparse_voxels(raw)
-    logger.info("occupancy-3d: %d voxels, %d classes, %d positions",
-                sparse['num_voxels'], len(sparse.get('classes',[])), len(sparse.get('positions',[])))
-
-    # Add camera frustum data for 3D visualization
-    sample = _st.get('sample')
-    frustums = []
-    if sample:
-        for ci in range(len(sample.get('images', []))):
-            try:
-                E = np.array(sample['ego_to_cameras'][ci])
-                cam_from_ego = np.linalg.inv(E) if np.linalg.det(E) != 0 else E
-                cam_pos = cam_from_ego[:3, 3].tolist()
-                frustums.append({'cam_pos': cam_pos, 'name': CAMERA_NAMES[ci] if ci < len(CAMERA_NAMES) else f'CAM_{ci}'})
-            except Exception:
-                pass
-    sparse['camera_frustums'] = frustums
-    return JSONResponse(sparse)
 
 @server.get("/api/backends")
 async def api_backends():
@@ -338,6 +345,447 @@ async def api_attribute(req: AttrReq):
         uris.append(_pil_uri(Image.fromarray((np.clip(h,0,1)*255).astype(np.uint8), mode='L'), fmt='PNG'))
     return JSONResponse({'heatmaps':uris,'status':f'{req.method} [{req.cell_i},{req.cell_j}] {req.class_name} {elapsed:.2f}s'})
 
+# ── VLM Endpoints ────────────────────────────────────────────────────────────
+
+NUSCENES_SAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'samples')
+
+@server.get("/api/vlm/images")
+async def api_vlm_images():
+    """List available camera images from data/samples/ (no nuscenes package needed)."""
+    cams = ['CAM_FRONT','CAM_FRONT_RIGHT','CAM_FRONT_LEFT','CAM_BACK','CAM_BACK_LEFT','CAM_BACK_RIGHT']
+    result = {}
+    for cam in cams:
+        cam_dir = os.path.join(NUSCENES_SAMPLES_DIR, cam)
+        if os.path.isdir(cam_dir):
+            files = sorted([f for f in os.listdir(cam_dir) if f.endswith('.jpg')])
+            result[cam] = files[:50]  # limit to 50 per camera for UI
+    return JSONResponse(result)
+
+@server.get("/api/vlm/image/{camera}/{filename}")
+async def api_vlm_image(camera: str, filename: str):
+    """Serve a camera image directly from data/samples/."""
+    import re
+    # Sanitize to prevent path traversal
+    if not re.match(r'^CAM_[A-Z_]+$', camera) or '..' in filename:
+        return JSONResponse({'error': 'Invalid path'}, status_code=400)
+    path = os.path.join(NUSCENES_SAMPLES_DIR, camera, filename)
+    if not os.path.isfile(path):
+        return JSONResponse({'error': 'Image not found'}, status_code=404)
+    return StreamingResponse(open(path, 'rb'), media_type='image/jpeg')
+
+class VLMGenerateReq(BaseModel):
+    camera: str = 'CAM_FRONT'
+    filename: str = ''
+    prompt: str = "Describe this driving scene."
+    attn_method: str = 'avg'  # 'avg' (all-layers average) or 'rollout'
+
+class VLMAttentionReq(BaseModel):
+    token_index: int
+    method: str = 'GradCAM'
+
+@server.get("/api/vlm/debug")
+async def api_vlm_debug():
+    """Diagnostic endpoint — dump everything relevant to VLM loading."""
+    info = {}
+    try:
+        import transformers
+        info['transformers_version'] = transformers.__version__
+    except: info['transformers_version'] = 'IMPORT FAILED'
+    # Check preprocessor_config.json
+    import pipeline.vlm.model as vm
+    ckpt = os.path.normpath(vm.LOCAL_CHECKPOINT)
+    info['local_checkpoint'] = ckpt
+    info['checkpoint_exists'] = os.path.isdir(ckpt)
+    pp_path = os.path.join(ckpt, 'preprocessor_config.json')
+    info['preprocessor_config_exists'] = os.path.isfile(pp_path)
+    if os.path.isfile(pp_path):
+        info['preprocessor_config'] = json.load(open(pp_path))
+    cfg_path = os.path.join(ckpt, 'config.json')
+    if os.path.isfile(cfg_path):
+        cfg = json.load(open(cfg_path))
+        info['config_model_type'] = cfg.get('model_type')
+    # Check which image processor classes are registered
+    try:
+        from transformers.models.auto.image_processing_auto import IMAGE_PROCESSOR_MAPPING_NAMES
+        info['registered_image_processors'] = {k: v for k, v in IMAGE_PROCESSOR_MAPPING_NAMES.items() if 'idefics' in k.lower() or 'smol' in k.lower()}
+    except: info['registered_image_processors'] = 'UNAVAILABLE'
+    # Check if Idefics3ImageProcessor exists
+    try:
+        from transformers import Idefics3ImageProcessor
+        info['Idefics3ImageProcessor'] = 'EXISTS'
+    except ImportError:
+        info['Idefics3ImageProcessor'] = 'NOT FOUND'
+    try:
+        from transformers import SmolVLMImageProcessor
+        info['SmolVLMImageProcessor'] = 'EXISTS'
+    except ImportError:
+        info['SmolVLMImageProcessor'] = 'NOT FOUND'
+    info['vlm_ok'] = _vlm_ok
+    info['checkpoint_files'] = os.listdir(ckpt) if os.path.isdir(ckpt) else []
+    return JSONResponse(info)
+
+@server.post("/api/vlm/load")
+async def api_vlm_load():
+    if not _vlm_ok:
+        return JSONResponse({'ok': False, 'error': 'VLM module not available'})
+    if _vlm_st['runner'] and _vlm_st['runner'].loaded:
+        return JSONResponse({'ok': True, 'status': 'Already loaded'})
+    try:
+        runner = VLMRunner()
+        device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+        runner.load(device=device)
+        _vlm_st['runner'] = runner
+        return JSONResponse({'ok': True, 'status': f'Loaded on {device}'})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({'ok': False, 'error': str(e)})
+
+@server.post("/api/vlm/generate")
+async def api_vlm_generate(req: VLMGenerateReq):
+    runner = _vlm_st.get('runner')
+    if not runner or not runner.loaded:
+        return JSONResponse({'error': 'Load VLM first'})
+    # Load image directly from disk (no nuscenes package needed)
+    if not req.filename:
+        return JSONResponse({'error': 'No image selected'})
+    img_path = os.path.join(NUSCENES_SAMPLES_DIR, req.camera, req.filename)
+    if not os.path.isfile(img_path):
+        return JSONResponse({'error': f'Image not found: {req.camera}/{req.filename}'})
+    try:
+        _vlm_attr_cache.clear()
+        image = Image.open(img_path).convert('RGB')
+        t0 = time.time()
+        result = runner.generate(image, req.prompt)
+        gen_elapsed = time.time() - t0
+        # Compute word-level attention (one forward pass for all words)
+        attn_method = req.attn_method if req.attn_method in ('avg', 'rollout') else 'avg'
+        t1 = time.time()
+        words = runner.compute_word_attentions(method=attn_method)
+        attn_elapsed = time.time() - t1
+        _vlm_attr_cache.clear()
+        image_uri = _pil_uri(image, fmt='JPEG', q=75)
+        # Return words with strength scores (frontend renders color-coded text)
+        word_data = [{"text": w["text"], "strength": round(w["strength"], 3)} for w in words]
+        return JSONResponse({
+            'text': result['text'],
+            'tokens': result['tokens'],
+            'words': word_data,
+            'image_uri': image_uri,
+            'status': f'Generated {len(result["tokens"])} tokens, {len(words)} words | '
+                       f'gen {gen_elapsed:.1f}s + {attn_method} {attn_elapsed:.1f}s',
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({'error': str(e)})
+
+@server.post("/api/vlm/attention")
+async def api_vlm_attention(req: VLMAttentionReq):
+    runner = _vlm_st.get('runner')
+    if not runner or not runner.loaded:
+        return JSONResponse({'error': 'Load VLM first'})
+    if runner._tokens is None:
+        return JSONResponse({'error': 'Generate text first'})
+    method_key = VLM_METHODS.get(req.method, 'gradcam')
+    cache_key = (req.token_index, method_key)
+    if cache_key in _vlm_attr_cache:
+        hm = _vlm_attr_cache[cache_key]
+    else:
+        try:
+            t0 = time.time()
+            hm = runner.get_cam_heatmap(req.token_index, method=method_key)
+            elapsed = time.time() - t0
+            _vlm_attr_cache[cache_key] = hm
+            logger.info("VLM CAM %s token[%d] in %.2fs", req.method, req.token_index, elapsed)
+        except Exception as e:
+            traceback.print_exc()
+            return JSONResponse({'error': str(e)})
+    # Render heatmap overlay using viz/camera.py
+    from viz.camera import render_camera
+    image = runner._image
+    token_text = runner._tokens[req.token_index]['text'] if req.token_index < len(runner._tokens) else '?'
+    overlay = render_camera(image, heatmap=hm, camera_name=f'Token: {token_text.strip()}')
+    return JSONResponse({
+        'heatmap': _pil_uri(overlay, fmt='JPEG', q=82),
+        'token_text': token_text,
+    })
+
+class VLMWordReq(BaseModel):
+    word_index: int
+
+@server.post("/api/vlm/word-attention")
+async def api_vlm_word_attention(req: VLMWordReq):
+    runner = _vlm_st.get('runner')
+    if not runner or not runner.loaded:
+        return JSONResponse({'error': 'Load VLM first'})
+    if runner._words is None:
+        return JSONResponse({'error': 'Generate text first'})
+    if req.word_index >= len(runner._words):
+        return JSONResponse({'error': f'Word index {req.word_index} out of range'})
+    cache_key = ("word", req.word_index)
+    if cache_key in _vlm_attr_cache:
+        uri = _vlm_attr_cache[cache_key]
+    else:
+        from viz.camera import render_camera
+        hm = runner.get_word_heatmap(req.word_index)
+        word = runner._words[req.word_index]
+        overlay = render_camera(runner._image, heatmap=hm, camera_name=f'{word["text"]}')
+        uri = _pil_uri(overlay, fmt='JPEG', q=82)
+        _vlm_attr_cache[cache_key] = uri
+    word = runner._words[req.word_index]
+    return JSONResponse({
+        'heatmap': uri,
+        'word': word['text'],
+        'strength': word['strength'],
+    })
+
+# ── VLM→BEV Projection Endpoints ─────────────────────────────────────────────
+
+class VLMBevReq(BaseModel):
+    prompt: str = "Describe the vehicle closest to the camera in detail."
+    camera: str = 'CAM_FRONT'
+    filename: str = ''
+
+@server.post("/api/vlm-bev/run")
+async def api_vlm_bev_run(req: VLMBevReq):
+    """Generate text, compute attention, project to BEV, overlay with LSS."""
+    from viz.bev_projection import project_heatmap_to_bev, render_vlm_bev
+    from viz.camera import render_camera
+
+    runner = _vlm_st.get('runner')
+    if not runner or not runner.loaded:
+        if _vlm_ok:
+            runner = VLMRunner()
+            device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+            runner.load(device=device)
+            _vlm_st['runner'] = runner
+        else:
+            return JSONResponse({'error': 'VLM not available'})
+
+    if not req.filename:
+        return JSONResponse({'error': 'No image selected. Pick a camera and image first.'})
+
+    img_path = os.path.join(NUSCENES_SAMPLES_DIR, req.camera, req.filename)
+    if not os.path.isfile(img_path):
+        return JSONResponse({'error': f'Image not found: {req.camera}/{req.filename}'})
+
+    # Auto-load scene + LSS matching the selected image
+    sample = _st.get('sample')
+    if _pipeline_ok:
+        try:
+            from pipeline.data import load_sample_by_filename
+            new_sample = load_sample_by_filename(req.camera, req.filename)
+            _st['sample'] = new_sample
+            model = _ensure_model(backend_name='lss')
+            if model and _st['sample']:
+                backend = _st.get('backend')
+                if backend:
+                    _st['raw_output'] = backend.get_raw_output(model, _st['sample'])
+                    _st['bev_grid'] = backend.get_bev_grid(_st['raw_output'])
+                else:
+                    _st['bev_grid'] = infer(model, _st['sample'])
+                logger.info("Loaded scene for %s/%s, BEV grid: %s",
+                            req.camera, req.filename, _st['bev_grid'].shape)
+        except Exception as e:
+            logger.warning("Scene load failed: %s", e)
+
+    sample = _st.get('sample')
+    has_calib = sample and 'ego_to_cameras' in sample and 'intrinsics' in sample
+
+    try:
+        t0 = time.time()
+        image = Image.open(img_path).convert('RGB')
+
+        # 1. Generate text + compute word attentions
+        runner.generate(image, req.prompt, max_new_tokens=80)
+        words = runner.compute_word_attentions(method="avg")
+
+        # 2. Build aggregate attention heatmap — top-5 strongest content words
+        scored = [(i, w['strength']) for i, w in enumerate(words)
+                  if len(w['text']) >= 3 and w['strength'] > 0.1]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_indices = [i for i, _ in scored[:5]]
+        if not top_indices:
+            top_indices = list(range(min(5, len(words))))
+        content_heatmaps = [runner.get_word_heatmap(i) for i in top_indices]
+        agg_heatmap = np.maximum.reduce(content_heatmaps) if content_heatmaps else np.zeros((image.size[1], image.size[0]))
+
+        # 3. Render camera image with attention overlay
+        cam_img = render_camera(image, heatmap=agg_heatmap, camera_name=req.camera)
+
+        # 4. Project to BEV (only if calibration available)
+        bev_img = None
+        if has_calib:
+            ci = CAMERA_NAMES.index(req.camera) if req.camera in CAMERA_NAMES else 0
+            K = np.array(sample['intrinsics'][ci], dtype=np.float64)
+            if K.shape == (9,):
+                K = K.reshape(3, 3)
+            E = np.array(sample['ego_to_cameras'][ci], dtype=np.float64)
+            if E.shape == (16,):
+                E = E.reshape(4, 4)
+
+            bev_attn = project_heatmap_to_bev(
+                agg_heatmap, K, E,
+                grid_range=GRID_RANGE, resolution=RESOLUTION, grid_cells=GRID_CELLS
+            )
+
+            # LSS vehicle mask overlay
+            lss_mask = None
+            bev_grid = _st.get('bev_grid')
+            if bev_grid is not None and bev_grid.ndim == 3:
+                vehicle_logits = bev_grid[0]
+                lss_mask = vehicle_logits > 0.3
+
+            bev_img = render_vlm_bev(bev_attn, lss_bev_mask=lss_mask,
+                                      gt_boxes=_st.get('bev_gt_boxes'),
+                                      grid_range=GRID_RANGE, resolution=RESOLUTION)
+
+        elapsed = time.time() - t0
+        word_list = [{'text': w['text'], 'strength': round(w['strength'], 3)} for w in words]
+        gen_text = runner.processor.tokenizer.decode(runner._generated_ids, skip_special_tokens=True)
+
+        result = {
+            'camera_image': _pil_uri(cam_img, fmt='JPEG', q=80),
+            'text': gen_text,
+            'words': word_list,
+            'status': f'{len(words)} words, {elapsed:.1f}s',
+        }
+        if bev_img:
+            result['bev_image'] = _pil_uri(bev_img, fmt='PNG')
+        else:
+            result['bev_warn'] = 'Load a scene in BEV tab first for calibration data'
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({'error': str(e)})
+
+class VLMBevWordReq(BaseModel):
+    word_index: int
+    camera: str = 'CAM_FRONT'
+
+@server.post("/api/vlm-bev/word")
+async def api_vlm_bev_word(req: VLMBevWordReq):
+    """Project a single word's attention to BEV and camera."""
+    from viz.bev_projection import project_heatmap_to_bev, render_vlm_bev
+    from viz.camera import render_camera
+
+    runner = _vlm_st.get('runner')
+    if not runner or runner._word_heatmaps is None:
+        return JSONResponse({'error': 'Run a prompt first'})
+    if req.word_index >= len(runner._word_heatmaps):
+        return JSONResponse({'error': 'Word index out of range'})
+
+    sample = _st.get('sample')
+    heatmap = runner.get_word_heatmap(req.word_index)
+    word_text = runner._words[req.word_index]['text']
+
+    # Camera image with this word's attention
+    cam_img = render_camera(runner._image, heatmap=heatmap,
+                            camera_name=f'"{word_text}"')
+
+    # BEV projection
+    bev_img = None
+    if sample and 'ego_to_cameras' in sample:
+        ci = CAMERA_NAMES.index(req.camera) if req.camera in CAMERA_NAMES else 0
+        K = np.array(sample['intrinsics'][ci], dtype=np.float64)
+        if K.shape == (9,): K = K.reshape(3, 3)
+        E = np.array(sample['ego_to_cameras'][ci], dtype=np.float64)
+        if E.shape == (16,): E = E.reshape(4, 4)
+
+        bev_attn = project_heatmap_to_bev(heatmap, K, E,
+                                           grid_range=GRID_RANGE, resolution=RESOLUTION,
+                                           grid_cells=GRID_CELLS)
+        lss_mask = None
+        bev_grid = _st.get('bev_grid')
+        if bev_grid is not None and bev_grid.ndim == 3:
+            lss_mask = bev_grid[0] > 0.3
+        bev_img = render_vlm_bev(bev_attn, lss_bev_mask=lss_mask,
+                                  gt_boxes=_st.get('bev_gt_boxes'),
+                                  grid_range=GRID_RANGE, resolution=RESOLUTION)
+
+    result = {
+        'camera_image': _pil_uri(cam_img, fmt='JPEG', q=82),
+        'word': word_text,
+    }
+    if bev_img:
+        result['bev_image'] = _pil_uri(bev_img, fmt='PNG')
+    return JSONResponse(result)
+
+class VLMBevClickReq(BaseModel):
+    x_frac: float  # click x as fraction of image width [0, 1]
+    y_frac: float  # click y as fraction of image height [0, 1]
+    camera: str = 'CAM_FRONT'
+
+@server.post("/api/vlm-bev/click")
+async def api_vlm_bev_click(req: VLMBevClickReq):
+    """Project a BEV click to camera pixel and return camera image with crosshair."""
+    from viz.camera import render_camera
+
+    sample = _st.get('sample')
+    if not sample or 'ego_to_cameras' not in sample:
+        return JSONResponse({'error': 'No calibration data'})
+
+    runner = _vlm_st.get('runner')
+    if not runner or runner._image is None:
+        return JSONResponse({'error': 'Run a VLM prompt first'})
+
+    # Reconstruct BEV crop parameters (must match render_vlm_bev)
+    grid_cells = GRID_CELLS  # 200
+    half = grid_cells // 2   # 100
+    lateral_half = min(70, half)
+    col_start = half - lateral_half
+    crop_h = half             # rows 0..99
+    crop_w = lateral_half * 2 # 140
+
+    # Click fraction → cropped grid cell
+    crop_i = req.y_frac * crop_h
+    crop_j = req.x_frac * crop_w
+
+    # Cropped cell → full grid cell
+    full_i = crop_i
+    full_j = crop_j + col_start
+
+    # Full grid cell → BEV world coords
+    wx = -GRID_RANGE + (full_j + 0.5) * RESOLUTION
+    wz = GRID_RANGE - (full_i + 0.5) * RESOLUTION
+
+    # BEV world → ego frame
+    ego_x, ego_y, ego_z = wz, -wx, 0.0
+
+    # Ego → camera pixel
+    ci = CAMERA_NAMES.index(req.camera) if req.camera in CAMERA_NAMES else 0
+    K = np.array(sample['intrinsics'][ci], dtype=np.float64)
+    if K.shape == (9,):
+        K = K.reshape(3, 3)
+    E = np.array(sample['ego_to_cameras'][ci], dtype=np.float64)
+    if E.shape == (16,):
+        E = E.reshape(4, 4)
+
+    ego_pt = np.array([ego_x, ego_y, ego_z, 1.0])
+    cam_pt = E @ ego_pt
+    if cam_pt[2] <= 0:
+        return JSONResponse({'error': 'Point behind camera', 'u': -1, 'v': -1})
+
+    px = K @ cam_pt[:3]
+    u = px[0] / px[2]
+    v = px[1] / px[2]
+
+    # Render camera image with crosshair
+    image = runner._image
+    cam_img = render_camera(image, heatmap=None, camera_name=req.camera,
+                            projection_point=(u, v))
+
+    dist = float(np.sqrt(ego_x**2 + ego_y**2))
+    return JSONResponse({
+        'camera_image': _pil_uri(cam_img, fmt='JPEG', q=82),
+        'u': round(float(u)),
+        'v': round(float(v)),
+        'ego_x': round(float(ego_x), 1),
+        'ego_y': round(float(ego_y), 1),
+        'dist_m': round(dist, 1),
+    })
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FRONTEND
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,8 +793,6 @@ async def api_attribute(req: AttrReq):
 FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BEV Attribution Debug</title>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0a;color:#e0e0e0;font-family:'Consolas','Monaco','Menlo',monospace;overflow:hidden;height:100vh}
@@ -387,15 +833,6 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:'Consolas','Monaco','Menlo',mo
 #bev-c{width:100%;height:100%;object-fit:contain;cursor:crosshair;display:block}
 #bev-tip{position:fixed;pointer-events:none;background:rgba(0,0,0,.92);color:#5cf;padding:4px 8px;border-radius:3px;font-size:10px;border:1px solid #2a4a4a;display:none;white-space:nowrap;z-index:9999}
 #bev-info{font-size:10px;color:#888;padding:2px 4px;flex-shrink:0;min-height:14px}
-
-/* 3D Occupancy viewer */
-#occ3d-wrap{position:relative;overflow:hidden;border-radius:4px;display:none;background:#050505}
-#occ3d-wrap canvas{display:block}
-#occ3d-bar{position:absolute;bottom:6px;left:6px;right:6px;display:flex;gap:6px;align-items:center;z-index:10;font-size:9px;flex-wrap:wrap}
-.occ3d-chip{padding:2px 7px;border-radius:3px;cursor:pointer;border:1px solid #333;font-size:9px;transition:all .15s;user-select:none}
-.occ3d-chip.off{opacity:.3}
-.occ3d-chip:hover{border-color:#fff}
-#occ3d-stats{position:absolute;top:6px;right:8px;font-size:9px;color:#888;z-index:10}
 
 /* Camera panel */
 #cam-panel{flex:1;display:flex;flex-direction:column;gap:4px;min-width:0}
@@ -454,16 +891,63 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:'Consolas','Monaco','Menlo',mo
 #log-body::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
 
 .cfg-act{display:flex;gap:8px;justify-content:flex-end}
+
+/* Mode tabs */
+#mode-tabs{display:flex;gap:4px}
+#mode-tabs .tab.on{background:#0a2a2a}
+
+/* VLM panel */
+#vlm-panel{display:none;flex:1;gap:8px;min-height:0}
+#vlm-panel.active{display:flex}
+#vlm-img-wrap{flex:2;position:relative;min-height:0;background:#050505;border-radius:6px;overflow:hidden}
+#vlm-img-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+#vlm-sidebar{width:360px;display:flex;flex-direction:column;gap:8px;background:#111;border:1px solid #1a3a3a;border-radius:6px;padding:10px;overflow-y:auto;min-height:0}
+#vlm-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex-shrink:0}
+#vlm-controls select,#vlm-controls input{background:#1a1a1a;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font:inherit;font-size:11px}
+#vlm-controls input[type="text"]{flex:1;min-width:120px}
+#vlm-prompt-row{display:flex;gap:6px;align-items:center;flex-shrink:0;width:100%}
+#vlm-prompt{flex:1;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:4px 8px;border-radius:3px;font:inherit;font-size:11px}
+#vlm-text-output{flex:1;overflow-y:auto;line-height:1.8;font-size:13px;padding:4px;min-height:0}
+#vlm-text-output .vlm-word{display:inline;padding:2px 4px;cursor:pointer;border-radius:3px;transition:all .15s;user-select:none;margin:1px}
+#vlm-text-output .vlm-word:hover{outline:1px solid #5cf}
+#vlm-text-output .vlm-word.active{outline:2px solid #5cf;color:#fff}
+#vlm-loading{color:#888;font-size:11px;padding:8px 0}
+#vlm-status{font-size:10px;color:#888;flex-shrink:0}
+
+/* VLM→BEV panel */
+#vb-panel{display:none;flex:1;gap:8px;min-height:0}
+#vb-panel.active{display:flex}
+#vb-left{flex:1;display:flex;flex-direction:column;gap:4px;min-height:0;background:#111;border:1px solid #1a3a3a;border-radius:6px;padding:8px}
+#vb-left .ph-t{color:#5cf;font-weight:bold;font-size:13px}
+#vb-bev-wrap{flex:1;position:relative;min-height:0;overflow:hidden;border-radius:4px}
+#vb-bev-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+#vb-legend{font-size:10px;color:#888;padding:2px 4px;flex-shrink:0}
+#vb-right{flex:1;display:flex;flex-direction:column;gap:6px;min-height:0}
+#vb-cam-wrap{flex:1;position:relative;min-height:0;background:#050505;border-radius:6px;overflow:hidden}
+#vb-cam-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+#vb-controls{display:flex;flex-direction:column;gap:6px;background:#111;border:1px solid #1a3a3a;border-radius:6px;padding:10px;flex-shrink:0}
+#vb-presets{display:flex;gap:6px}
+#vb-prompt-row{display:flex;gap:6px;align-items:center}
+#vb-prompt{flex:1;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:4px 8px;border-radius:3px;font:inherit;font-size:11px}
+#vb-text-output{max-height:120px;overflow-y:auto;font-size:12px;line-height:1.6;padding:4px}
+#vb-text-output .vb-word{display:inline;padding:1px 3px;border-radius:2px}
+#vb-status{font-size:10px;color:#888}
 </style>
 </head><body>
 <div id="app">
-  <div id="hdr"><h1>BEV GRID — CAMERA ATTRIBUTION DEBUG</h1></div>
+  <div id="hdr">
+    <h1>BEV & VLM ATTRIBUTION DEBUG</h1>
+    <div id="mode-tabs">
+      <button class="tab on" data-mode="bev">BEV Attribution</button>
+      <button class="tab" data-mode="vlm">VLM Reasoning</button>
+      <button class="tab" data-mode="vb">VLM→BEV</button>
+    </div>
+  </div>
 
   <div id="ctrl">
     <div class="cg"><label>Scene</label><select id="sel-scene"></select></div>
     <div class="cg"><label>Sample</label><select id="sel-sample"></select></div>
-    <div class="cg"><label>Model</label><select id="sel-repr"></select></div>
-    <div class="cg"><label title="Target class for Class heatmap and GradCAM attribution">Class</label><select id="sel-class"></select></div>
+    <div class="cg"><label>Class</label><select id="sel-class"><option value="vehicle">vehicle</option></select></div>
     <div class="cg"><label>Method</label><select id="sel-method"></select><i class="info-icon" id="method-info">i</i></div>
     <button class="btn" id="btn-load">Load Scene</button>
     <button class="btn" id="btn-attr">Run Attribution</button>
@@ -474,16 +958,13 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:'Consolas','Monaco','Menlo',mo
     <div id="bev-panel">
       <div class="ph">
         <div class="tabs" id="bev-tabs">
-          <span class="tab-label">2D:</span>
           <button class="tab on" data-m="argmax" data-tip="Per-cell class with highest logit, color-coded">Argmax</button>
-          <button class="tab" data-m="class_heatmap" data-tip="Heatmap of selected class confidence across the grid">Class</button>
-          <button class="tab" data-m="composite" data-tip="Alpha-blended overlay of all class confidences">Blend</button>
-          <span class="tab-label" style="margin-left:6px">3D:</span>
-          <button class="tab" data-m="3d" id="tab-3d" disabled data-tip="Interactive 3D occupancy voxel grid (sparse, top-k by confidence)">Occupancy</button>
+          <button class="tab" data-m="class_heatmap" data-tip="Heatmap of vehicle confidence across the grid">Heatmap</button>
         </div>
+        <button class="tab" id="bev-coverage-toggle" title="Show/hide camera coverage on BEV">Coverage</button>
+        <button class="tab" id="bev-gt-toggle" title="Show/hide ground truth 3D bounding boxes">GT Boxes</button>
       </div>
       <div id="bev-wrap"><canvas id="bev-c" width="800" height="800"></canvas><div id="bev-tip"></div></div>
-      <div id="occ3d-wrap"><div id="occ3d-stats"></div><div id="occ3d-bar"></div></div>
       <div id="bev-info">Hover to inspect · Click to select</div>
     </div>
 
@@ -498,6 +979,69 @@ body{background:#0a0a0a;color:#e0e0e0;font-family:'Consolas','Monaco','Menlo',mo
         <button class="cfg-btn" id="cfg-open" title="Edit Calibration">⚙</button>
       </div>
       <div id="cam-grid"></div>
+    </div>
+
+    <div id="vlm-panel">
+      <div id="vlm-img-wrap">
+        <img id="vlm-img" src="" alt="Select a camera and generate">
+      </div>
+      <div id="vlm-sidebar">
+        <div id="vlm-controls">
+          <label style="color:#888;font-size:10px">Camera</label>
+          <select id="vlm-cam-select"></select>
+          <label style="color:#888;font-size:10px">Image</label>
+          <select id="vlm-file-select" style="max-width:180px" onchange="vlmPreviewImage()"></select>
+          <label style="color:#888;font-size:10px">Aggregation</label>
+          <select id="vlm-attn-method">
+            <option value="avg" selected>All-Layers Avg (recommended)</option>
+            <option value="rollout">Attention Rollout (demo: attention sink)</option>
+          </select>
+        </div>
+        <div id="vlm-prompt-row">
+          <input id="vlm-prompt" type="text" value="Describe this driving scene." placeholder="Prompt...">
+          <button class="btn" id="vlm-generate-btn">Generate</button>
+        </div>
+        <div id="vlm-loading" style="display:none">Loading model...</div>
+        <div id="vlm-text-output"></div>
+        <div id="vlm-status"></div>
+      </div>
+    </div>
+
+    <div id="vb-panel">
+      <div id="vb-left">
+        <div class="ph"><span class="ph-t">BEV Projection</span></div>
+        <div id="vb-bev-wrap"><img id="vb-bev-img" src="" alt="Run a prompt to project attention to BEV"></div>
+        <div id="vb-legend">■ VLM attention (turbo) · ○ LSS vehicle detections (cyan) · ▲ ego</div>
+      </div>
+      <div id="vb-right">
+        <div id="vb-cam-wrap"><img id="vb-cam-img" src="" alt="Front camera"></div>
+        <div id="vb-controls">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <label style="color:#888;font-size:10px">Camera</label>
+            <select id="vb-cam-select" style="background:#1a1a1a;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font:inherit;font-size:11px"></select>
+            <label style="color:#888;font-size:10px">Image</label>
+            <select id="vb-file-select" style="max-width:180px;background:#1a1a1a;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font:inherit;font-size:11px"></select>
+          </div>
+          <div id="vb-presets">
+            <select id="vb-preset-select" style="background:#1a1a1a;border:1px solid #333;color:#ccc;padding:3px 6px;border-radius:3px;font:inherit;font-size:11px;flex:1">
+              <option value="">-- Preset Prompts --</option>
+              <option value="Describe the color of each vehicle in this image, from closest to most distant.">Vehicle Colors</option>
+              <option value="Describe the vehicle closest to the camera in detail.">Closest Vehicle</option>
+              <option value="Describe the most distant vehicle visible ahead.">Farthest Vehicle</option>
+              <option value="Describe the ego vehicle's current driving environment.">Driving Environment</option>
+              <option value="What are the key objects and events in the driver's field of view?">Key Objects</option>
+              <option value="Describe traffic conditions, road structure, and agent behaviors.">Traffic & Agents</option>
+            </select>
+            <button class="btn" id="vb-btn-preset">Use Preset</button>
+          </div>
+          <div id="vb-prompt-row">
+            <input id="vb-prompt" type="text" value="Describe the color of each vehicle in this image, from closest to most distant." placeholder="Custom prompt...">
+            <button class="btn" id="vb-btn-run">Run</button>
+          </div>
+          <div id="vb-text-output"></div>
+          <div id="vb-status"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -550,7 +1094,7 @@ const CN=['CAM_FRONT','CAM_FRONT_RIGHT','CAM_FRONT_LEFT','CAM_BACK','CAM_BACK_LE
 const CC=['#00ccff','#66ff33','#ff6600','#ffcc00','#ff33cc','#9966ff'];
 const GI=[2,0,1,4,3,5]; // grid order: FL,F,FR,BL,B,BR → data indices
 const GN=['FRONT_LEFT','FRONT','FRONT_RIGHT','BACK_LEFT','BACK','BACK_RIGHT'];
-let CLASSES=['car','truck','bus','trailer','construction_vehicle','pedestrian','motorcycle','bicycle','traffic_cone','barrier'];
+let CLASSES=['vehicle'];
 const METHODS=['GradCAM','Integrated Gradients','Attention','Occlusion'];
 
 // ─── Populate selects ───────────────────────────────────────────────────────
@@ -558,7 +1102,7 @@ const selScene=document.getElementById('sel-scene');
 const selSample=document.getElementById('sel-sample');
 const selClass=document.getElementById('sel-class');
 const selMethod=document.getElementById('sel-method');
-const selRepr=document.getElementById('sel-repr');
+const selRepr=document.getElementById('sel-repr')||document.createElement('select'); // removed from UI
 for(let i=0;i<10;i++){const o=document.createElement('option');o.value=i;o.textContent='Scene '+i;selScene.appendChild(o);}
 for(let i=0;i<40;i++){const o=document.createElement('option');o.value=i;o.textContent='Sample '+i;selSample.appendChild(o);}
 function populateClasses(names){
@@ -707,41 +1251,6 @@ function camPixelToRay(ci, u, v) {
   return {org, dir};
 }
 
-// Find nearest voxel along a camera ray in 3D mode
-function raycastVoxel(ci, u, v) {
-  if(!occ3dData || occ3dData.num_voxels === 0) return null;
-  const ray = camPixelToRay(ci, u, v);
-  if(!ray) return null;
-
-  const pos = occ3dData.positions;
-  const vs = occ3dData.voxel_size; // [dz, dy, dx]
-  const halfX = vs[2] / 2, halfY = vs[1] / 2, halfZ = vs[0] / 2;
-  let bestIdx = -1, bestT = Infinity;
-
-  // Sample along ray, check each voxel for intersection
-  // For efficiency, check all voxels against the ray (30K is manageable)
-  for(let k = 0; k < occ3dData.num_voxels; k++) {
-    const vx = pos[k*3], vy = pos[k*3+1], vz = pos[k*3+2]; // ego coords
-
-    // AABB ray intersection: voxel centered at (vx, vy, vz) with half-extents
-    const tMinX = ((vx - halfX) - ray.org[0]) / (ray.dir[0] || 1e-20);
-    const tMaxX = ((vx + halfX) - ray.org[0]) / (ray.dir[0] || 1e-20);
-    const tMinY = ((vy - halfY) - ray.org[1]) / (ray.dir[1] || 1e-20);
-    const tMaxY = ((vy + halfY) - ray.org[1]) / (ray.dir[1] || 1e-20);
-    const tMinZ = ((vz - halfZ) - ray.org[2]) / (ray.dir[2] || 1e-20);
-    const tMaxZ = ((vz + halfZ) - ray.org[2]) / (ray.dir[2] || 1e-20);
-
-    const tEnter = Math.max(Math.min(tMinX,tMaxX), Math.min(tMinY,tMaxY), Math.min(tMinZ,tMaxZ));
-    const tExit  = Math.min(Math.max(tMinX,tMaxX), Math.max(tMinY,tMaxY), Math.max(tMinZ,tMaxZ));
-
-    if(tEnter <= tExit && tExit > 0 && tEnter < bestT) {
-      bestT = tEnter > 0 ? tEnter : 0;
-      bestIdx = k;
-    }
-  }
-  return bestIdx >= 0 ? {idx: bestIdx, depth: bestT} : null;
-}
-
 // ─── BEV helpers ────────────────────────────────────────────────────────────
 function c2w(i,j){if(!D)return[0,0];const g=D.bev_info.grid_range,r=D.bev_info.resolution;return[-g+(j+.5)*r,g-(i+.5)*r];}
 function px2cell(cx,cy){
@@ -753,14 +1262,114 @@ function px2cell(cx,cy){
 }
 
 // ─── Draw BEV ───────────────────────────────────────────────────────────────
+let showCoverage = false;
+let showGtBoxes = false;
+
 function drawBev(){
   ctx.clearRect(0,0,800,800);
   if(bevBg&&bevBg.complete)ctx.drawImage(bevBg,0,0,800,800);
   else{ctx.fillStyle='#0a0a0a';ctx.fillRect(0,0,800,800);}
   if(!D)return;
   const n=D.bev_info.grid_cells,c=800/n;
+  if(showCoverage) drawCamCoverage(ctx, n, c);
   if(hover&&(!sel||hover.i!==sel.i||hover.j!==sel.j)){ctx.strokeStyle='rgba(80,200,220,.45)';ctx.lineWidth=1.5;ctx.strokeRect(hover.j*c,hover.i*c,c,c);}
   if(sel){ctx.fillStyle='rgba(80,220,255,.25)';ctx.fillRect(sel.j*c,sel.i*c,c,c);ctx.strokeStyle='#5cf';ctx.lineWidth=2;ctx.strokeRect(sel.j*c,sel.i*c,c,c);}
+}
+
+// Camera coverage toggle
+document.getElementById('bev-coverage-toggle').addEventListener('click', function(){
+  showCoverage = !showCoverage;
+  this.classList.toggle('on', showCoverage);
+  drawBev();
+});
+
+// GT boxes toggle
+document.getElementById('bev-gt-toggle').addEventListener('click', function(){
+  showGtBoxes = !showGtBoxes;
+  this.classList.toggle('on', showGtBoxes);
+  if(D) {
+    const src = showGtBoxes && D.bev_images_gt ? D.bev_images_gt[bevMode] || D.bev_images_gt.argmax : D.bev_images[bevMode] || D.bev_images.argmax;
+    if(src) { bevBg = new Image(); bevBg.onload = () => drawBev(); bevBg.src = src; }
+  }
+});
+
+// Draw camera FOV divider lines from ego center to BEV edges
+function drawCamCoverage(ctx, gridCells, cellPx) {
+  if(!D || !extr.length) return;
+  const g = D.bev_info.grid_range;
+  const size = gridCells * cellPx;
+  const cx = size / 2, cy = size / 2; // ego = center of BEV
+
+  for(let ci = 0; ci < 6; ci++) {
+    if(!extr[ci] || !intr[ci]) continue;
+    const sz = D.image_sizes[ci] || [1600, 900];
+    const Ki = inv3x3(intr[ci]);
+    const Ei = inv4x4(extr[ci]);
+    if(!Ki || !Ei) continue;
+
+    // Unproject left and right image edges at mid-height to get FOV boundaries
+    const midV = sz[1] / 2;
+    const edges = [[0, midV], [sz[0], midV]]; // left edge, right edge
+
+    for(const [pu, pv] of edges) {
+      const ray_cam = m3v3(Ki, [pu, pv, 1]);
+      const ray_ego = [
+        Ei[0]*ray_cam[0] + Ei[1]*ray_cam[1] + Ei[2]*ray_cam[2],
+        Ei[4]*ray_cam[0] + Ei[5]*ray_cam[1] + Ei[6]*ray_cam[2],
+        Ei[8]*ray_cam[0] + Ei[9]*ray_cam[1] + Ei[10]*ray_cam[2]
+      ];
+
+      // Extend ray to BEV edge (use large t)
+      const len = Math.sqrt(ray_ego[0]**2 + ray_ego[1]**2) || 1;
+      const dx = ray_ego[0] / len, dy = ray_ego[1] / len;
+      const far = g * 1.5; // extend past grid edge
+      const ego_x = dx * far, ego_y = dy * far;
+
+      // Ego → BEV pixel
+      const wx = -ego_y, wz = ego_x;
+      const px_x = (wx + g) / (2 * g) * size;
+      const px_y = (g - wz) / (2 * g) * size;
+
+      ctx.save();
+      ctx.strokeStyle = CC[ci];
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(px_x, px_y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // Label: draw camera name near ego center along the center ray direction
+    const ray_cam_c = m3v3(Ki, [sz[0]/2, sz[1]/2, 1]);
+    const ray_ego_c = [
+      Ei[0]*ray_cam_c[0] + Ei[1]*ray_cam_c[1] + Ei[2]*ray_cam_c[2],
+      Ei[4]*ray_cam_c[0] + Ei[5]*ray_cam_c[1] + Ei[6]*ray_cam_c[2],
+      Ei[8]*ray_cam_c[0] + Ei[9]*ray_cam_c[1] + Ei[10]*ray_cam_c[2]
+    ];
+    const clen = Math.sqrt(ray_ego_c[0]**2 + ray_ego_c[1]**2) || 1;
+    const labelDist = 55; // pixels from center
+    const lx = cx + (-ray_ego_c[1] / clen) * labelDist;
+    const ly = cy + (-ray_ego_c[0] / clen) * labelDist;
+    ctx.save();
+    ctx.fillStyle = CC[ci];
+    ctx.globalAlpha = 0.7;
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(CN[ci].replace('CAM_',''), lx, ly);
+    ctx.restore();
+  }
+
+  // Ego dot
+  ctx.save();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
 }
 
 // ─── Build camera cards ─────────────────────────────────────────────────────
@@ -786,35 +1395,7 @@ function buildCards(){
       const v = (e.clientY - rect.top) / rect.height * cv.height;
       camClickMark = {gi, u, v};
 
-      // 3D mode: raycast against voxels
-      if(bevMode === '3d' && occ3dData && occ3d) {
-        const vhit = raycastVoxel(ci, u, v);
-        if(vhit) {
-          const pos = occ3dData.positions;
-          const eX = pos[vhit.idx*3], eY = pos[vhit.idx*3+1], eZ = pos[vhit.idx*3+2];
-          const cls = occ3dData.classes[vhit.idx];
-          const clsName = occ3dData.class_names[cls] || cls;
-          info.textContent = `${CN[ci]} → voxel #${vhit.idx}: ${clsName} @ ego(${eX.toFixed(1)},${eY.toFixed(1)},${eZ.toFixed(1)}) d=${vhit.depth.toFixed(1)}m`;
-          // Highlight voxel in 3D viewer (reuse the existing click handler logic)
-          drawCams(null, [eX, eY, eZ]);
-          // Add highlight sphere
-          if(occ3d) {
-            if(occ3d._highlightSphere) { occ3d.scene.remove(occ3d._highlightSphere); }
-            const sGeo = new THREE.SphereGeometry(1.2, 12, 12);
-            const sMat = new THREE.MeshBasicMaterial({color:0xffffff, wireframe:true, transparent:true, opacity:0.8});
-            occ3d._highlightSphere = new THREE.Mesh(sGeo, sMat);
-            occ3d._highlightSphere.position.set(-eY, eZ, -eX);
-            occ3d.scene.add(occ3d._highlightSphere);
-            document.getElementById('occ3d-stats').textContent = `Voxel #${vhit.idx}: ${clsName} @ ego(${eX.toFixed(1)},${eY.toFixed(1)},${eZ.toFixed(1)})`;
-          }
-        } else {
-          info.textContent = `${CN[ci]} (${u.toFixed(0)},${v.toFixed(0)}) → no voxel hit`;
-          drawCams(sel ? c2w(sel.i, sel.j) : null);
-        }
-        return;
-      }
-
-      // 2D mode: BEV ground intersection
+      // BEV ground intersection
       const hit = camPixelToBEV(ci, u, v);
       if(hit) {
         sel = {i: hit.i, j: hit.j};
@@ -888,6 +1469,23 @@ function drawCams(wp, ego3d){
 }
 
 // ─── BEV events ─────────────────────────────────────────────────────────────
+// Point-in-polygon (ray casting) for GT box hit testing
+function pointInPoly(px,py,corners){
+  let inside=false;
+  for(let i=0,j=corners.length-1;i<corners.length;j=i++){
+    const xi=corners[i][0],yi=corners[i][1],xj=corners[j][0],yj=corners[j][1];
+    if(((yi>py)!==(yj>py))&&(px<(xj-xi)*(py-yi)/(yj-yi)+xi))inside=!inside;
+  }
+  return inside;
+}
+function findGtBox(wx,wz){
+  if(!D||!D.gt_boxes||!showGtBoxes)return null;
+  for(const b of D.gt_boxes){
+    if(pointInPoly(wx,wz,b.corners))return b;
+  }
+  return null;
+}
+
 bevC.addEventListener('mousemove',e=>{
   if(!D)return;
   const r=bevC.getBoundingClientRect(),cx=e.clientX-r.left,cy=e.clientY-r.top;
@@ -900,6 +1498,9 @@ bevC.addEventListener('mousemove',e=>{
       const idx=cell.i*D.bev_info.grid_cells+cell.j;
       t+=` | ${D.bev_info.class_names[D.bev_info.cell_classes[idx]]} ${D.bev_info.cell_confs[idx].toFixed(2)}`;
     }
+    const gtBox=findGtBox(wx,wz);
+    if(gtBox) t+=`\nGT: ${gtBox.class_name}`;
+    tip.style.whiteSpace='pre-wrap';
     tip.textContent=t;drawBev();drawCams([wx,wz]);
   }else{tip.style.display='none';drawBev();drawCams(sel?c2w(sel.i,sel.j):null);}
 });
@@ -928,20 +1529,9 @@ document.addEventListener('keydown',e=>{
 document.querySelectorAll('#bev-tabs .tab').forEach(b=>b.addEventListener('click',()=>{
   document.querySelectorAll('#bev-tabs .tab').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');bevMode=b.dataset.m;
-  const is3d = bevMode === '3d';
   const bevWrap = document.getElementById('bev-wrap');
-  const occ3dWrap = document.getElementById('occ3d-wrap');
-  if(is3d){
-    // Copy bev-wrap dimensions to occ3d-wrap before hiding bev-wrap
-    const bRect = bevWrap.getBoundingClientRect();
-    occ3dWrap.style.width = bRect.width + 'px';
-    occ3dWrap.style.height = bRect.height + 'px';
-  }
-  bevWrap.style.display = is3d ? 'none' : '';
-  occ3dWrap.style.display = is3d ? 'block' : 'none';
-  if(is3d){
-    load3DView();
-  } else if(D&&D.bev_images&&D.bev_images[bevMode]){
+  bevWrap.style.display = '';
+  if(D&&D.bev_images&&D.bev_images[bevMode]){
     bevBg=new Image();bevBg.onload=()=>drawBev();bevBg.src=D.bev_images[bevMode];
   }else{fetchBev();}
 }));
@@ -1001,15 +1591,13 @@ async function fetchScene(){
     if(D.bev_info&&D.bev_info.class_names)populateClasses(D.bev_info.class_names);
     // Update repr type availability
     if(D.repr_types)updateReprTypes(D.repr_types);
-    // Show/hide 3D tab based on model capability
-    document.getElementById('tab-3d').disabled = !D.has_3d;
-    // Reset to BEV view if switching away from 3D model
-    if(!D.has_3d && bevMode==='3d'){
+    // 3D tab removed (LSS-only)
+    if(bevMode==='3d'){
       bevMode='argmax';
       document.querySelectorAll('#bev-tabs .tab').forEach(x=>x.classList.remove('on'));
       document.querySelector('#bev-tabs .tab[data-m="argmax"]').classList.add('on');
       document.getElementById('bev-wrap').style.display='';
-      document.getElementById('occ3d-wrap').style.display='none';
+      // 3D viewer removed (LSS-only)
     }
     // Load BEV bg
     bevBg=new Image();bevBg.onload=()=>drawBev();bevBg.src=D.bev_images[bevMode]||D.bev_images.argmax;
@@ -1046,6 +1634,9 @@ async function fetchAttr(){
     const r=await res.json();
     if(r.error){setStatus('Error: '+r.error);}
     else if(r.heatmaps&&r.heatmaps.length===6){
+      // Clear old heatmaps before loading new ones
+      hmImgs = Array(6).fill(null);
+      drawCams(sel?c2w(sel.i,sel.j):null);
       for(let ci=0;ci<6;ci++){
         if(r.heatmaps[ci]){hmImgs[ci]=new Image();hmImgs[ci].onload=((_ci)=>()=>drawCams(sel?c2w(sel.i,sel.j):null))(ci);hmImgs[ci].src=r.heatmaps[ci];}
       }
@@ -1136,292 +1727,387 @@ fetch('/api/backends').then(r=>r.json()).then(types=>{
 
 buildCards();drawBev();drawCams(null);
 
-// ─── 3D Occupancy Viewer (three.js) ────────────────────────────────────────
-let occ3d = null; // {scene, camera, renderer, controls, mesh, animId}
-let occ3dData = null;
-let occ3dClassVis = {}; // class index -> visible bool
+// ─── VLM Panel ───────────────────────────────────────────────────────────────
+let vlmLoaded = false, vlmTokens = [], vlmWords = [], vlmActiveWord = -1;
+const vlmAttnCache = new Map();
+let vlmHoverTimer = null;
+let vlmCurrentMode = 'bev';
 
-function init3D() {
-  if (occ3d) return occ3d;
-  console.log('[3D] init3D called, THREE:', typeof THREE, 'OrbitControls:', typeof THREE.OrbitControls);
-  const container = document.getElementById('occ3d-wrap');
-  const w = container.clientWidth, h = container.clientHeight;
-  console.log('[3D] init3D container:', w, 'x', h);
-
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x050505);
-
-  const camera = new THREE.PerspectiveCamera(50, w / h, 0.5, 200);
-  camera.position.set(40, 30, 40);
-  camera.lookAt(0, 0, 0);
-
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setSize(w, h);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  container.insertBefore(renderer.domElement, container.firstChild);
-
-  const controls = new THREE.OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.12;
-  controls.target.set(0, 0, -1);
-  controls.maxDistance = 150;
-
-  // Lights
-  scene.add(new THREE.AmbientLight(0x404040, 1.5));
-  const dir = new THREE.DirectionalLight(0xffffff, 1.2);
-  dir.position.set(30, 50, 20);
-  scene.add(dir);
-
-  // Ground grid — GridHelper lies on XZ plane by default (Y=up), which matches our mapping
-  const grid = new THREE.GridHelper(102.4, 20, 0x1a3a3a, 0x111111);
-  grid.position.set(0, -5, 0);  // Y=-5 = ego Z=-5m (ground level)
-  scene.add(grid);
-
-  // Ego marker (small arrow)
-  const egoGeo = new THREE.ConeGeometry(0.8, 2, 4);
-  const egoMat = new THREE.MeshLambertMaterial({ color: 0x00ccff });
-  const ego = new THREE.Mesh(egoGeo, egoMat);
-  ego.rotation.x = -Math.PI / 2;
-  ego.position.set(0, 0, 0);
-  scene.add(ego);
-
-  // Axes: X=red(forward), Y=green(left), Z=blue(up)
-  const axes = new THREE.AxesHelper(8);
-  scene.add(axes);
-
-  occ3d = { scene, camera, renderer, controls, mesh: null, animId: null, camLines: [] };
-
-  // Click→camera backtracking
-  setup3DClickHandler(occ3d);
-
-  // Animate
-  function animate() {
-    occ3d.animId = requestAnimationFrame(animate);
-    controls.update();
-    renderer.render(scene, camera);
-  }
-  animate();
-
-  // Resize observer
-  const ro = new ResizeObserver(() => {
-    const cw = container.clientWidth, ch = container.clientHeight;
-    if (cw > 0 && ch > 0) {
-      camera.aspect = cw / ch;
-      camera.updateProjectionMatrix();
-      renderer.setSize(cw, ch);
+// Mode switching
+document.querySelectorAll('#mode-tabs .tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#mode-tabs .tab').forEach(b => b.classList.remove('on'));
+    btn.classList.add('on');
+    vlmCurrentMode = btn.dataset.mode;
+    const bevPanel = document.getElementById('bev-panel');
+    const camPanel = document.getElementById('cam-panel');
+    const vlmPanel = document.getElementById('vlm-panel');
+    const vbPanel = document.getElementById('vb-panel');
+    const ctrl = document.getElementById('ctrl');
+    // Hide all panels
+    bevPanel.style.display = 'none';
+    camPanel.style.display = 'none';
+    vlmPanel.style.display = 'none';
+    vlmPanel.classList.remove('active');
+    vbPanel.style.display = 'none';
+    vbPanel.classList.remove('active');
+    ctrl.style.display = 'none';
+    if (vlmCurrentMode === 'bev') {
+      bevPanel.style.display = '';
+      camPanel.style.display = '';
+      ctrl.style.display = '';
+    } else if (vlmCurrentMode === 'vlm') {
+      vlmPanel.style.display = 'flex';
+      vlmPanel.classList.add('active');
+      vlmPopulateCameras();
+    } else if (vlmCurrentMode === 'vb') {
+      vbPanel.style.display = 'flex';
+      vbPanel.classList.add('active');
+      vbPopulateSelectors();
+      // Show existing BEV image with GT boxes if scene is loaded
+      if (D && D.bev_images_gt && D.bev_images_gt.argmax) {
+        document.getElementById('vb-bev-img').src = D.bev_images_gt.argmax;
+      } else if (D && D.bev_images && D.bev_images.argmax) {
+        document.getElementById('vb-bev-img').src = D.bev_images.argmax;
+      }
     }
   });
-  ro.observe(container);
+});
 
-  return occ3d;
-}
+let vlmImageIndex = {};  // {CAM_FRONT: [file1.jpg, ...], ...}
 
-function populate3DVoxels(data) {
-  const o = init3D();
-  occ3dData = data;
-
-  // Remove old mesh
-  if (o.mesh) { o.scene.remove(o.mesh); o.mesh.geometry.dispose(); o.mesh = null; }
-  // Remove old camera lines
-  o.camLines.forEach(l => o.scene.remove(l));
-  o.camLines = [];
-
-  if (!data || data.num_voxels === 0) {
-    document.getElementById('occ3d-stats').textContent = '0 voxels';
-    console.warn('[3D] No voxels to display');
-    return;
-  }
-
-  const N = data.num_voxels;
-  const pos = data.positions;
-  const cls = data.classes;
-  const colors = data.class_colors;
-  const voxSize = data.voxel_size; // [dz, dy, dx]
-  console.log('[3D] populate:', N, 'voxels, voxel_size:', voxSize, 'positions length:', pos.length);
-  console.log('[3D] first 3 positions:', pos.slice(0, 9));
-  console.log('[3D] class_colors type:', typeof colors, Array.isArray(colors) ? 'array len=' + colors.length : '');
-
-  // Build class visibility toggles
-  occ3dClassVis = {};
-  const uniqueClasses = [...new Set(cls)].sort((a, b) => a - b);
-  uniqueClasses.forEach(c => { occ3dClassVis[c] = true; });
-  buildClassChips(data);
-
-  // Create InstancedMesh
-  const geo = new THREE.BoxGeometry(voxSize[2] * 0.92, voxSize[1] * 0.92, voxSize[0] * 0.92);
-  const mat = new THREE.MeshLambertMaterial();
-  const mesh = new THREE.InstancedMesh(geo, mat, N);
-
-  const dummy = new THREE.Object3D();
-  const color = new THREE.Color();
-
-  for (let i = 0; i < N; i++) {
-    const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
-    // Map: ego X(fwd) -> three.js Z(-), ego Y(left) -> three.js X(-), ego Z(up) -> three.js Y
-    dummy.position.set(-y, z, -x);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(i, dummy.matrix);
-
-    const c = cls[i];
-    const rgb = colors[c] || [128, 128, 128];
-    color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
-    mesh.setColorAt(i, color);
-  }
-
-  mesh.instanceMatrix.needsUpdate = true;
-  mesh.instanceColor.needsUpdate = true;
-  o.scene.add(mesh);
-  o.mesh = mesh;
-  console.log('[3D] mesh added to scene, children:', o.scene.children.length);
-  console.log('[3D] camera pos:', o.camera.position.toArray(), 'target:', o.controls.target.toArray());
-
-  // Camera frustums
-  if (data.camera_frustums) {
-    data.camera_frustums.forEach((cf, ci) => {
-      const cp = cf.cam_pos;
-      const pts = [new THREE.Vector3(-cp[1], cp[2], -cp[0]), new THREE.Vector3(0, 0, 0)];
-      const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
-      const lineColor = ci < CC.length ? new THREE.Color(CC[ci]) : new THREE.Color(0x888888);
-      const lineMat = new THREE.LineBasicMaterial({ color: lineColor, opacity: 0.5, transparent: true });
-      const line = new THREE.Line(lineGeo, lineMat);
-      o.scene.add(line);
-      o.camLines.push(line);
-    });
-  }
-
-  document.getElementById('occ3d-stats').textContent = N.toLocaleString() + ' voxels';
-}
-
-// ─── 3D Click→Camera backtracking ───────────────────────────────────────────
-function setup3DClickHandler(o) {
-  const raycaster = new THREE.Raycaster();
-  const mouse = new THREE.Vector2();
-  let highlightSphere = null;
-
-  o.renderer.domElement.addEventListener('click', (e) => {
-    if (!o.mesh || !occ3dData) return;
-    const rect = o.renderer.domElement.getBoundingClientRect();
-    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
-    raycaster.setFromCamera(mouse, o.camera);
-    const hits = raycaster.intersectObject(o.mesh);
-    if (hits.length === 0) {
-      // Click on empty space — clear selection
-      if (highlightSphere) { o.scene.remove(highlightSphere); highlightSphere = null; }
-      document.getElementById('occ3d-stats').textContent = occ3dData.num_voxels.toLocaleString() + ' voxels';
-      drawCams(null);
-      return;
-    }
-
-    const idx = hits[0].instanceId;
-    const pos = occ3dData.positions;
-    const egoX = pos[idx * 3], egoY = pos[idx * 3 + 1], egoZ = pos[idx * 3 + 2];
-    const cls = occ3dData.classes[idx];
-    const conf = occ3dData.confidences[idx];
-    const clsName = occ3dData.class_names[cls] || cls;
-
-    console.log('[3D] Click voxel #' + idx + ': ego(' + egoX.toFixed(1) + ',' + egoY.toFixed(1) + ',' + egoZ.toFixed(1) + ') class=' + clsName);
-
-    // Show highlight sphere at clicked voxel
-    if (highlightSphere) o.scene.remove(highlightSphere);
-    const sGeo = new THREE.SphereGeometry(1.2, 12, 12);
-    const sMat = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.8 });
-    highlightSphere = new THREE.Mesh(sGeo, sMat);
-    highlightSphere.position.set(-egoY, egoZ, -egoX); // ego→three.js mapping
-    o.scene.add(highlightSphere);
-
-    // Update stats
-    document.getElementById('occ3d-stats').textContent =
-      `Voxel #${idx}: ${clsName} (${conf.toFixed(2)}) @ ego(${egoX.toFixed(1)}, ${egoY.toFixed(1)}, ${egoZ.toFixed(1)})`;
-
-    // Project to cameras — ego coords go directly to proj()
-    drawCams(null, [egoX, egoY, egoZ]);
-    layoutCams();
-  });
-}
-
-function buildClassChips(data) {
-  const bar = document.getElementById('occ3d-bar');
-  bar.innerHTML = '';
-  const counts = {};
-  data.classes.forEach(c => { counts[c] = (counts[c] || 0) + 1; });
-  const sorted = Object.keys(counts).map(Number).sort((a, b) => counts[b] - counts[a]);
-
-  sorted.forEach(ci => {
-    const chip = document.createElement('span');
-    chip.className = 'occ3d-chip';
-    const rgb = data.class_colors[ci] || [128, 128, 128];
-    chip.style.background = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.3)`;
-    chip.style.color = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-    chip.style.borderColor = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-    chip.textContent = (data.class_names[ci] || ci) + ' ' + counts[ci];
-    chip.dataset.cls = ci;
-    if (!occ3dClassVis[ci]) chip.classList.add('off');
-    chip.addEventListener('click', () => {
-      occ3dClassVis[ci] = !occ3dClassVis[ci];
-      chip.classList.toggle('off');
-      updateVoxelVisibility();
-    });
-    bar.appendChild(chip);
-  });
-}
-
-function updateVoxelVisibility() {
-  if (!occ3d || !occ3d.mesh || !occ3dData) return;
-  const mesh = occ3d.mesh;
-  const cls = occ3dData.classes;
-  const N = occ3dData.num_voxels;
-  const pos = occ3dData.positions;
-  const dummy = new THREE.Object3D();
-
-  let visCount = 0;
-  for (let i = 0; i < N; i++) {
-    const c = cls[i];
-    if (occ3dClassVis[c]) {
-      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
-      dummy.position.set(-y, z, -x);
-      dummy.scale.set(1, 1, 1);
-    } else {
-      dummy.position.set(0, -100, 0); // hide offscreen
-      dummy.scale.set(0, 0, 0);
-    }
-    dummy.updateMatrix();
-    mesh.setMatrixAt(i, dummy.matrix);
-  }
-  mesh.instanceMatrix.needsUpdate = true;
-}
-
-async function load3DView() {
-  const container = document.getElementById('occ3d-wrap');
-  const cw = container.clientWidth, ch = container.clientHeight;
-  console.log('[3D] container size:', cw, 'x', ch);
-  if (cw === 0 || ch === 0) {
-    document.getElementById('occ3d-stats').textContent = 'Layout error (0x0)';
-    console.error('[3D] Container has 0 dimensions');
-    return;
-  }
-  const o = init3D();
-  // Force resize to match container
-  o.camera.aspect = cw / ch;
-  o.camera.updateProjectionMatrix();
-  o.renderer.setSize(cw, ch);
-
-  document.getElementById('occ3d-stats').textContent = 'Loading...';
+async function vlmPopulateCameras() {
+  const sel = document.getElementById('vlm-cam-select');
+  if (sel.children.length > 0) return;
   try {
-    const r = await fetch('/api/occupancy-3d', { method: 'POST' });
-    console.log('[3D] API status:', r.status);
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      document.getElementById('occ3d-stats').textContent = err.error || 'No 3D data';
-      return;
+    const r = await fetch('/api/vlm/images');
+    vlmImageIndex = await r.json();
+    Object.keys(vlmImageIndex).forEach(cam => {
+      const opt = document.createElement('option');
+      opt.value = cam; opt.textContent = cam + ' (' + vlmImageIndex[cam].length + ')';
+      sel.appendChild(opt);
+    });
+    // Add image file selector
+    vlmUpdateFileList();
+    sel.addEventListener('change', vlmUpdateFileList);
+  } catch(e) { console.error('vlmPopulateCameras:', e); }
+}
+
+function vlmUpdateFileList() {
+  const cam = document.getElementById('vlm-cam-select').value;
+  let fsel = document.getElementById('vlm-file-select');
+  if (!fsel) return;
+  fsel.innerHTML = '';
+  const files = vlmImageIndex[cam] || [];
+  files.forEach((f, i) => {
+    const opt = document.createElement('option');
+    opt.value = f;
+    // Show a short label: just the timestamp part
+    const parts = f.split('__');
+    opt.textContent = parts.length >= 3 ? '#' + i + ' t=' + parts[2].replace('.jpg','') : f;
+    fsel.appendChild(opt);
+  });
+  // Preview selected image
+  vlmPreviewImage();
+}
+
+function vlmPreviewImage() {
+  const cam = document.getElementById('vlm-cam-select').value;
+  const fsel = document.getElementById('vlm-file-select');
+  if (!fsel || !fsel.value) return;
+  document.getElementById('vlm-img').src = '/api/vlm/image/' + cam + '/' + fsel.value;
+}
+
+async function vlmEnsureLoaded() {
+  if (vlmLoaded) return true;
+  const ld = document.getElementById('vlm-loading');
+  ld.style.display = ''; ld.textContent = 'Loading SmolVLM-256M... (first time downloads ~500MB)';
+  try {
+    const r = await fetch('/api/vlm/load', {method:'POST'});
+    const d = await r.json();
+    ld.style.display = 'none';
+    if (d.ok) { vlmLoaded = true; return true; }
+    ld.style.display = ''; ld.textContent = 'Load failed: ' + (d.error || '');
+    return false;
+  } catch(e) {
+    ld.style.display = ''; ld.textContent = 'Load error: ' + e.message;
+    return false;
+  }
+}
+
+document.getElementById('vlm-generate-btn').addEventListener('click', vlmGenerate);
+
+async function vlmGenerate() {
+  const btn = document.getElementById('vlm-generate-btn');
+  btn.disabled = true; btn.classList.add('loading');
+  if (!await vlmEnsureLoaded()) { btn.disabled = false; btn.classList.remove('loading'); return; }
+  const cam = document.getElementById('vlm-cam-select').value || 'CAM_FRONT';
+  const fsel = document.getElementById('vlm-file-select');
+  const filename = fsel ? fsel.value : '';
+  if (!filename) { btn.disabled = false; btn.classList.remove('loading'); return; }
+  const prompt = document.getElementById('vlm-prompt').value;
+  const statusEl = document.getElementById('vlm-status');
+  statusEl.textContent = 'Generating...';
+  try {
+    const r = await fetch('/api/vlm/generate', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({camera: cam, filename: filename, prompt: prompt,
+        attn_method: document.getElementById('vlm-attn-method').value})
+    });
+    const d = await r.json();
+    if (d.error) { statusEl.textContent = 'Error: ' + d.error; return; }
+    // Show camera image
+    document.getElementById('vlm-img').src = d.image_uri;
+    // Method selector removed — aggregation dropdown handles this now
+    // Render tokens
+    vlmTokens = d.tokens;
+    vlmWords = d.words || [];
+    vlmActiveWord = -1;
+    vlmAttnCache.clear();
+    vlmRenderWords(vlmWords);
+    statusEl.textContent = d.status || '';
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.classList.remove('loading');
+  }
+}
+
+let vlmCamRunning = false;  // concurrency guard — only one CAM at a time
+
+function vlmRenderWords(words) {
+  const container = document.getElementById('vlm-text-output');
+  container.innerHTML = '';
+  words.forEach((word, idx) => {
+    const span = document.createElement('span');
+    span.className = 'vlm-word';
+    span.textContent = word.text + ' ';
+    span.dataset.idx = idx;
+    // Color-code by strength: 0=transparent dark, 1=bright cyan bg
+    const s = word.strength || 0;
+    const r = Math.round(10 + s * 20), g = Math.round(30 + s * 50), b = Math.round(30 + s * 60);
+    span.style.background = `rgb(${r},${g},${b})`;
+    span.style.color = s > 0.5 ? '#fff' : '#aaa';
+    span.addEventListener('click', () => {
+      if (vlmCamRunning) return;
+      if (vlmActiveWord === idx) {
+        vlmActiveWord = -1;
+        document.querySelectorAll('.vlm-word').forEach(el => el.classList.remove('active'));
+        vlmRestoreBaseImage();
+      } else {
+        vlmActiveWord = idx;
+        document.querySelectorAll('.vlm-word').forEach(el => el.classList.remove('active'));
+        span.classList.add('active');
+        vlmShowWordAttention(idx);
+      }
+    });
+    container.appendChild(span);
+  });
+}
+
+function vlmRestoreBaseImage() {
+  const cam = document.getElementById('vlm-cam-select').value;
+  const fsel = document.getElementById('vlm-file-select');
+  if (fsel && fsel.value) {
+    document.getElementById('vlm-img').src = '/api/vlm/image/' + cam + '/' + fsel.value;
+  }
+  document.getElementById('vlm-status').textContent = '';
+}
+
+async function vlmShowWordAttention(wordIdx) {
+  if (vlmCamRunning) return;
+  const cacheKey = `word-${wordIdx}`;
+  if (vlmAttnCache.has(cacheKey)) {
+    document.getElementById('vlm-img').src = vlmAttnCache.get(cacheKey);
+    document.getElementById('vlm-status').textContent = `"${vlmWords[wordIdx]?.text}" (cached)`;
+    return;
+  }
+  vlmCamRunning = true;
+  const statusEl = document.getElementById('vlm-status');
+  statusEl.textContent = `Loading "${vlmWords[wordIdx]?.text}"...`;
+  try {
+    const r = await fetch('/api/vlm/word-attention', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({word_index: wordIdx})
+    });
+    const d = await r.json();
+    if (d.error) { statusEl.textContent = 'Error: ' + d.error; return; }
+    vlmAttnCache.set(cacheKey, d.heatmap);
+    document.getElementById('vlm-img').src = d.heatmap;
+    statusEl.textContent = `"${d.word}" (strength: ${(d.strength * 100).toFixed(0)}%)`;
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  } finally {
+    vlmCamRunning = false;
+  }
+}
+
+// ─── VLM→BEV Panel ──────────────────────────────────────────────────────────
+let vbRunning = false;
+
+// Populate VB camera/file selectors
+async function vbPopulateSelectors() {
+  const camSel = document.getElementById('vb-cam-select');
+  if (camSel.children.length > 0) return;
+  // Ensure image index is loaded
+  if (Object.keys(vlmImageIndex).length === 0) {
+    try {
+      const r = await fetch('/api/vlm/images');
+      vlmImageIndex = await r.json();
+    } catch(e) { console.error('vbPopulateSelectors fetch:', e); }
+  }
+  const cams = Object.keys(vlmImageIndex);
+  if (cams.length === 0) {
+    ['CAM_FRONT','CAM_FRONT_RIGHT','CAM_FRONT_LEFT','CAM_BACK','CAM_BACK_LEFT','CAM_BACK_RIGHT'].forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c; opt.textContent = c;
+      camSel.appendChild(opt);
+    });
+  } else {
+    cams.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c; opt.textContent = c;
+      camSel.appendChild(opt);
+    });
+  }
+  camSel.addEventListener('change', vbUpdateFileList);
+  vbUpdateFileList();
+}
+
+function vbUpdateFileList() {
+  const cam = document.getElementById('vb-cam-select').value;
+  const fsel = document.getElementById('vb-file-select');
+  fsel.innerHTML = '';
+  const files = vlmImageIndex[cam] || [];
+  files.forEach((f, i) => {
+    const opt = document.createElement('option');
+    opt.value = f;
+    const parts = f.split('__');
+    opt.textContent = parts.length >= 3 ? '#' + i + ' t=' + parts[2].replace('.jpg','') : f;
+    fsel.appendChild(opt);
+  });
+  // Preview on front camera panel
+  if (fsel.value) {
+    document.getElementById('vb-cam-img').src = '/api/vlm/image/' + cam + '/' + fsel.value;
+  }
+}
+document.getElementById('vb-file-select').addEventListener('change', () => {
+  const cam = document.getElementById('vb-cam-select').value;
+  const f = document.getElementById('vb-file-select').value;
+  if (f) document.getElementById('vb-cam-img').src = '/api/vlm/image/' + cam + '/' + f;
+});
+
+// Word click → project that word's attention to BEV + camera
+async function vbWordClick(wordIdx, spanEl) {
+  // Highlight selected word
+  document.querySelectorAll('#vb-text-output .vb-word').forEach(s => s.style.borderBottom = '');
+  spanEl.style.borderBottom = '2px solid #5cf';
+  const cam = document.getElementById('vb-cam-select').value || 'CAM_FRONT';
+  const statusEl = document.getElementById('vb-status');
+  statusEl.textContent = 'Projecting word to BEV...';
+  try {
+    const r = await fetch('/api/vlm-bev/word', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({word_index: wordIdx, camera: cam})
+    });
+    const d = await r.json();
+    if (d.error) { statusEl.textContent = 'Error: ' + d.error; return; }
+    if (d.bev_image) document.getElementById('vb-bev-img').src = d.bev_image;
+    if (d.camera_image) document.getElementById('vb-cam-img').src = d.camera_image;
+    statusEl.textContent = `Showing attention for "${d.word}"`;
+  } catch(e) { statusEl.textContent = 'Error: ' + e.message; }
+}
+
+// BEV click → project to camera
+document.getElementById('vb-bev-img').addEventListener('click', async (e) => {
+  const img = e.target;
+  const rect = img.getBoundingClientRect();
+  const x_frac = (e.clientX - rect.left) / rect.width;
+  const y_frac = (e.clientY - rect.top) / rect.height;
+  const cam = document.getElementById('vb-cam-select').value || 'CAM_FRONT';
+  const statusEl = document.getElementById('vb-status');
+  try {
+    const r = await fetch('/api/vlm-bev/click', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x_frac, y_frac, camera: cam})
+    });
+    const d = await r.json();
+    if (d.error) { statusEl.textContent = d.error; return; }
+    document.getElementById('vb-cam-img').src = d.camera_image;
+    statusEl.textContent = `BEV → pixel (${d.u}, ${d.v}) | ${d.dist_m}m from ego | ego (${d.ego_x}, ${d.ego_y})`;
+  } catch(e) { statusEl.textContent = 'Click error: ' + e.message; }
+});
+document.getElementById('vb-bev-img').style.cursor = 'crosshair';
+
+document.getElementById('vb-btn-preset').addEventListener('click', () => {
+  const sel = document.getElementById('vb-preset-select');
+  if (sel.value) {
+    document.getElementById('vb-prompt').value = sel.value;
+    vbRun();
+  }
+});
+document.getElementById('vb-preset-select').addEventListener('dblclick', () => {
+  const sel = document.getElementById('vb-preset-select');
+  if (sel.value) {
+    document.getElementById('vb-prompt').value = sel.value;
+    vbRun();
+  }
+});
+document.getElementById('vb-btn-run').addEventListener('click', vbRun);
+
+async function vbRun() {
+  if (vbRunning) return;
+  vbRunning = true;
+  const btn = document.getElementById('vb-btn-run');
+  btn.disabled = true; btn.classList.add('loading');
+  const statusEl = document.getElementById('vb-status');
+  statusEl.textContent = 'Running VLM + BEV projection...';
+
+  const cam = document.getElementById('vb-cam-select').value || 'CAM_FRONT';
+  const filename = document.getElementById('vb-file-select').value;
+  const prompt = document.getElementById('vb-prompt').value;
+
+  if (!filename) {
+    statusEl.textContent = 'Select an image first';
+    btn.disabled = false; btn.classList.remove('loading'); vbRunning = false;
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/vlm-bev/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt, camera: cam, filename})
+    });
+    const d = await r.json();
+    if (d.error) { statusEl.textContent = 'Error: ' + d.error; return; }
+
+    // Update images
+    if (d.bev_image) document.getElementById('vb-bev-img').src = d.bev_image;
+    if (d.camera_image) document.getElementById('vb-cam-img').src = d.camera_image;
+    if (d.bev_warn) statusEl.textContent = d.bev_warn;
+
+    // Render words with strength coloring + click to project individual word
+    const container = document.getElementById('vb-text-output');
+    container.innerHTML = '';
+    if (d.words) {
+      d.words.forEach((w, idx) => {
+        const span = document.createElement('span');
+        span.className = 'vb-word';
+        span.textContent = w.text + ' ';
+        span.style.cursor = 'pointer';
+        const s = w.strength;
+        span.style.background = `rgba(${Math.floor(s*90)},${Math.floor(s*200)},${Math.floor(s*255)},${s*0.5})`;
+        span.addEventListener('click', () => vbWordClick(idx, span));
+        container.appendChild(span);
+      });
     }
-    const data = await r.json();
-    console.log('[3D] Received:', data.num_voxels, 'voxels,', [...new Set(data.classes)].length, 'classes');
-    populate3DVoxels(data);
-  } catch (e) {
-    document.getElementById('occ3d-stats').textContent = 'Error: ' + e.message;
-    console.error('[3D] Error:', e);
+
+    statusEl.textContent = d.status || '';
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.classList.remove('loading');
+    vbRunning = false;
   }
 }
 
@@ -1431,5 +2117,7 @@ async function load3DView() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print("Starting BEV Attribution Debug Tool on http://0.0.0.0:7860 …", flush=True)
+    print("=== BEV Attribution Tool — imports complete ===", flush=True)
+    print(f"  pipeline_ok={_pipeline_ok}  backends_ok={_backends_ok}  vlm_ok={_vlm_ok}", flush=True)
+    print("Starting uvicorn on http://0.0.0.0:7860 …", flush=True)
     uvicorn.run(server, host='0.0.0.0', port=7860)
