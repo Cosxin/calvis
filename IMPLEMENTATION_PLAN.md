@@ -290,19 +290,39 @@ lens_logits, model_logits, _ = lens.apply(model, text, positions=[...])
 # lens_logits: {layer: logits}; readout = unembed(J_l @ h_l)
 ```
 
-**P3.1 Offline fitting (`scripts/fit_jlens.py`).** Target: **SmolVLM's language
-model** (`runner.model.model.text_model` — verify exact attribute path at
-runtime; it's the Idefics3/SmolVLM text backbone) with the model's `lm_head` as
-unembed, wrapped via `jlens.from_hf`. If the VLM backbone proves incompatible
-with `jlens.from_hf` (it expects a plain `AutoModelForCausalLM`), fall back to
-**`HuggingFaceTB/SmolLM2-135M-Instruct`** — the same LM family SmolVLM was built
-from — and note the substitution in the UI. Prompts: use the repo's
-`data/experiments` sets, or 100–200 sequences of generic web text; per the repo,
-~100 prompts is usable. Fit on CPU is slow but feasible for a 135M-scale LM
-(hours, run once); GPU if available. Output → `checkpoints/jlens/lens.pt`,
-tracked by LFS (`.gitattributes` already covers `*.pt`), committed.
+**P3.1 Lens acquisition — two tiers. Do 3a; 3b is an optional stretch.**
 
-**P3.2 `pipeline/jlens_runner.py`.** Loads `lens.pt` once; exposes:
+**Tier 3a (primary, no fitting needed):** use a **pre-fitted lens** from
+https://huggingface.co/neuronpedia/jacobian-lens (MIT license; covers ~40
+models). Pick **`qwen3.5-0.8b`** (or `gemma-3-1b-it` as alternate): large
+enough for the canonical multi-hop latent-reasoning demos to work, small
+enough for the CPU Space (one teacher-forced forward per input text,
+~5–15 s on 2 vCPU, cached thereafter). Load via
+`jlens.JacobianLens.from_pretrained("neuronpedia/jacobian-lens", filename="<model>/lens.pt")`
+plus the matching HF model. **Lens files are a few hundred MB — download at
+Docker build time (mirror the SmolVLM `snapshot_download` pattern in the
+Dockerfile); do NOT commit them to GitHub LFS (quota).** The J-space tab thus
+runs its own small LM, independent of the VLM; the "use VLM output" button
+feeds the generated description into it as input text.
+
+**Tier 3b (optional stretch, timebox 1 day, skip freely):** fit on **SmolVLM's
+own LM stream** for the faithful "watch the VLM think" story. The backbone is
+~135M (SmolLM2 family, Llama architecture), so fitting itself is cheap — no
+raw data needed (use the jacobian-lens repo's `data/experiments` prompt sets
+or ~100–200 generic web-text sequences; ~100 prompts is usable per the repo),
+backward passes dominate: ~1–4 h on CPU, minutes on any GPU. The risky part is
+plumbing, not compute: `jlens.from_hf` expects a plain `AutoModelForCausalLM`,
+so extract the VLM's text weights (`runner.model.model.text_model` — verify
+attribute path at runtime) + `lm_head` into a `LlamaForCausalLM` shell first
+(~half a day of surgery; validate by checking the extracted LM's next-token
+predictions match the VLM's on text-only input). Script: `scripts/fit_jlens.py`;
+output `checkpoints/jlens/lens.pt` (LFS-tracked, small at 135M scale:
+30 layers × 576² floats ≈ 40 MB — this one CAN be committed). If the
+extraction fights back, drop 3b and ship 3a only.
+
+**P3.2 `pipeline/jlens_runner.py`.** Lazy-loads the lens + its LM once
+(3a: pre-fitted lens + qwen/gemma model from HF cache; 3b: local `lens.pt` +
+extracted SmolVLM text model); exposes:
 ```python
 def run(text) -> {"tokens": [...], "grid": [[{"w": "car", "r": 3}, ...], ...]}
     # grid[layer][position] = top-1 word + its rank of the model's actual next token
